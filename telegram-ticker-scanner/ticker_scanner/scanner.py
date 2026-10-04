@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+from html import escape as _html_escape
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any, Protocol
 
@@ -25,12 +28,17 @@ from .evm_watcher import EvmWatcher
 from .health import SourceStats
 from .models import (
     LABEL_LAUNCH, LABEL_LIQ, LABEL_PAIR, LAUNCH, LIQUIDITY, PAIR, STATUS_LAUNCH, STATUS_LIQ, STATUS_PAIR,
-    Detection, Entry, Result, clean_text, normalize_ticker,
+    Detection, Entry, Result, clean_text, normalize_ticker, valid_address,
 )
 from .rpc import cancel_requested, wait_result
 from .solana import PumpPortalWatcher, SolanaLaunchpadWatcher
 
 log = logging.getLogger(__name__)
+
+
+def html_escape(text: str) -> str:
+    return _html_escape(text, quote=False)
+
 
 # DexScreener pairs created before the entry (minus this margin) are ignored.
 SCAN_MARGIN_S = 600
@@ -42,6 +50,45 @@ FOLLOWUP_DELAYS_S = (20, 60, 180)
 NEW_PAIR_LOOKUP_DELAYS_S = (3, 10, 30, 90)
 NOTIFY_RETRY_DELAYS_S = (2, 5, 15, 30, 60)
 SUPERVISOR_FIRST_DELAY_S = 1.0
+DS_SEARCH_LIMIT = 30   # DexScreener returns at most ~30 pairs per search
+DS_CONCURRENCY = 4
+FLOOD_WINDOW_S = 600
+FLOOD_SUMMARY_INTERVAL_S = 30
+
+
+class FloodGuard:
+    """Caps notifications per entry: a trending ticker gets hundreds of copies."""
+
+    def __init__(self, limit: int, window: float = FLOOD_WINDOW_S):
+        self.limit = limit
+        self.window = window
+        self._hits: dict[int, deque] = {}
+        self.suppressed: dict[int, int] = {}
+
+    def _trim(self, entry_id: int, now: float) -> deque:
+        hits = self._hits.setdefault(entry_id, deque())
+        while hits and now - hits[0] > self.window:
+            hits.popleft()
+        return hits
+
+    def allow(self, entry_id: int, now: float) -> bool:
+        if self.limit <= 0:
+            return True
+        hits = self._trim(entry_id, now)
+        if len(hits) < self.limit:
+            hits.append(now)
+            return True
+        self.suppressed[entry_id] = self.suppressed.get(entry_id, 0) + 1
+        return False
+
+    def due_summaries(self, now: float) -> list[tuple[int, int]]:
+        """(entry_id, suppressed count) for bursts that are over."""
+        out = []
+        for entry_id, count in list(self.suppressed.items()):
+            if len(self._trim(entry_id, now)) < self.limit:
+                out.append((entry_id, count))
+                del self.suppressed[entry_id]
+        return out
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -52,6 +99,8 @@ def is_retryable(exc: BaseException) -> bool:
 
 class Notifier(Protocol):
     async def send(self, entry: Entry, result: Result, labels: list[str], note: str | None) -> int | None: ...
+
+    async def notice(self, entry: Entry, text: str) -> None: ...
 
     async def edit(self, entry: Entry, result: Result, labels: list[str], note: str | None,
                    message_id: int) -> None: ...
@@ -84,6 +133,8 @@ class Scanner:
         self.notifications_failed = 0
         self.started_at = time.time()
         self.config_warnings: list[str] = []
+        self.flood = FloodGuard(settings.notify_flood_limit)
+        self.notifications_grouped = 0
         self.reload()
 
     def source_stats(self, name: str) -> SourceStats:
@@ -121,34 +172,77 @@ class Scanner:
         return sorted(name for name, task in self._sources.items() if not task.done())
 
     # ---- detections ----------------------------------------------------
-    async def on_detection(self, det: Detection) -> None:
+    def _sanitize(self, det: Detection) -> bool:
+        """Normalize and validate a detection coming from an untrusted source."""
+        chain = CHAINS.get(det.chain)
+        if chain is None:
+            return False
         det.token_address = norm_address(det.chain, det.token_address)
         det.pair_address = norm_address(det.chain, det.pair_address)
         det.quote_address = norm_address(det.chain, det.quote_address)
+        if det.pair_address is not None and not valid_address(chain.kind, det.pair_address, pool=True):
+            if det.kind != LAUNCH:
+                log.debug("détection ignorée (pair invalide): %r", det.pair_address)
+                return False
+            det.pair_address = None  # a launch is keyed by its token; the curve address is optional
+        if det.kind == LIQUIDITY:
+            if det.pair_address is None:
+                return False
+            if not valid_address(chain.kind, det.token_address):
+                det.token_address = ""
+        elif not valid_address(chain.kind, det.token_address):
+            log.debug("détection ignorée (adresse invalide): %r", det.token_address)
+            return False
+        if det.quote_address is not None and not valid_address(chain.kind, det.quote_address):
+            det.quote_address = None
         # Token names/symbols come from anyone deploying a contract: keep them tame.
         det.symbol = clean_text(det.symbol, 24)
         det.name = clean_text(det.name, 48)
         det.dex = clean_text(det.dex, 60)
         det.quote_symbol = clean_text(det.quote_symbol, 24) or None
+        det.market_cap_note = clean_text(det.market_cap_note, 24) or None
+        return True
+
+    def _is_new_for(self, entry: Entry, det: Detection, ticker: str) -> bool:
+        """Should a pair we did not know yet be reported for this entry?
+
+        Real-time sources (on-chain, PumpPortal) only report fresh events. For
+        DexScreener, a pair is new if it was created after the entry, or if it
+        is missing from the snapshot taken when the ticker started being
+        watched: that is a pair created earlier whose liquidity just arrived
+        (stealth launch). The snapshot is only trusted when it was complete.
+        """
+        if det.source != "dexscreener" or det.created_at >= entry.scan_since - SCAN_MARGIN_S:
+            return True
+        return (self.db.baseline_state(entry.id, ticker) is True
+                and not self.db.in_baseline(entry.id, det.chain, det.result_key))
+
+    async def on_detection(self, det: Detection) -> None:
+        if not self._sanitize(det):
+            return
         async with self._lock:
             if det.kind == LIQUIDITY:
                 self._on_liquidity(det)
                 return
-            symbol = normalize_ticker(det.symbol)
+            ticker = normalize_ticker(det.symbol)
             for entry in list(self._entries.values()):
-                if det.chain not in entry.chains or symbol not in entry.tickers:
-                    continue
-                if det.created_at < entry.scan_since - SCAN_MARGIN_S:
+                if det.chain not in entry.chains or ticker not in entry.tickers:
                     continue
                 existing = self.db.get_result(entry.id, det.chain, det.result_key)
                 if existing is None:
+                    if not self._is_new_for(entry, det, ticker):
+                        continue
                     if det.kind == LAUNCH:
                         status, labels = STATUS_LAUNCH, [LABEL_LAUNCH]
                     elif det.has_liquidity:
-                        status, labels = STATUS_LIQ, [LABEL_PAIR, LABEL_LIQ]
+                        status = STATUS_LIQ
+                        labels = [LABEL_LIQ] if det.pre_existing_pair else [LABEL_PAIR, LABEL_LIQ]
                     else:
                         status, labels = STATUS_PAIR, [LABEL_PAIR]
-                    result = self.db.insert_result(entry.id, det, status)
+                    try:
+                        result = self.db.insert_result(entry.id, det, status)
+                    except sqlite3.IntegrityError:  # entry deleted meanwhile
+                        continue
                     log.info("[%s] %s %s %s (%s)", entry.name, labels, det.symbol, det.chain, det.dex)
                     self._queue_notification(entry, result, labels, det.market_cap_note)
                 elif existing.status == STATUS_PAIR and det.has_liquidity:
@@ -176,12 +270,38 @@ class Scanner:
             entry, result, labels, note = await self._notify_queue.get()
             if self.notifier is None:
                 continue
+            bypass = (result.liquidity_usd or 0) >= self.settings.notify_flood_bypass_liq_usd
+            if not bypass and not self.flood.allow(entry.id, time.time()):
+                self.notifications_grouped += 1
+                if self.flood.suppressed.get(entry.id) == 1:
+                    threshold = f"{self.settings.notify_flood_bypass_liq_usd:,.0f}".replace(",", " ")
+                    await self._notice(entry, (
+                        f"🔕 <b>{html_escape(entry.name)}</b> : plus de {self.flood.limit} alertes en "
+                        f"{FLOOD_WINDOW_S // 60} min (copies probables du ticker). Les suivantes sont "
+                        f"regroupées, sauf celles avec plus de ${threshold} de liquidité. "
+                        "Tout reste visible dans 📋 Résultats."))
+                continue
             message_id = await self._send_with_retry(entry, result, labels, note)
             if message_id:
                 self.db.set_notify_message(result.id, message_id)
                 if result.has_liquidity and result.market_cap is None:
                     self._last_notif[result.id] = (message_id, labels, note)
                     self._spawn(self._followup(result.id))
+
+    async def _notice(self, entry: Entry, text: str) -> None:
+        try:
+            await self.notifier.notice(entry, text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("message d'information non envoyé: %r", exc)
+
+    async def flush_flood_summaries(self) -> None:
+        if self.notifier is None:
+            return
+        for entry_id, count in self.flood.due_summaries(time.time()):
+            entry = self.db.get_entry(entry_id)
+            if entry is not None:
+                await self._notice(entry, f"🔕 <b>{html_escape(entry.name)}</b> : {count} alerte(s) regroupée(s) "
+                                          "pendant la rafale. Détail dans 📋 Résultats.")
 
     async def _send_with_retry(self, entry: Entry, result: Result, labels: list[str],
                                note: str | None) -> int | None:
@@ -264,31 +384,64 @@ class Scanner:
                 return
 
     # ---- DexScreener ---------------------------------------------------
+    def _ds_detection(self, pair: dict) -> Detection | None:
+        det = pair_to_detection(pair)
+        if det is not None and det.kind == PAIR and not is_known_dex(pair) \
+                and self.db.has_launch(det.chain, det.token_address):
+            det.kind, det.pool_kind = LAUNCH, "launchpad"  # unknown launchpad dexId for a known launch
+        return det
+
     async def handle_dexscreener_pair(self, pair: dict, ticker: str, chains: set[str]) -> None:
         if normalize_ticker(base_symbol(pair)) != ticker:
             return
-        det = pair_to_detection(pair)
+        det = self._ds_detection(pair)
         if det is None or det.chain not in chains:
             return
-        if det.kind == PAIR and not is_known_dex(pair) and self.db.has_launch(det.chain, det.token_address):
-            det.kind, det.pool_kind = LAUNCH, "launchpad"
         await self.on_detection(det)
 
+    def take_baselines(self, ticker: str, pairs: list[dict]) -> None:
+        """Snapshot the pairs that already exist when an entry starts watching `ticker`."""
+        entries = [e for e in self._entries.values()
+                   if ticker in e.tickers and self.db.baseline_state(e.id, ticker) is None]
+        if not entries:
+            return
+        detections = []
+        for pair in pairs:
+            if normalize_ticker(base_symbol(pair)) != ticker:
+                continue
+            det = self._ds_detection(pair)
+            if det is not None and self._sanitize(det):
+                detections.append(det)
+        complete = len(pairs) < DS_SEARCH_LIMIT
+        for entry in entries:
+            keys = [(d.chain, d.result_key) for d in detections
+                    if d.chain in entry.chains and d.created_at < entry.scan_since - SCAN_MARGIN_S]
+            self.db.save_baseline(entry.id, ticker, keys, complete)
+
+    async def search_ticker(self, ticker: str, chains: set[str]) -> None:
+        pairs = await self.ds.search(ticker)
+        if pairs is None:
+            self.dexscreener_stats.error(f"recherche {ticker} sans réponse")
+            return
+        self.dexscreener_stats.event()
+        self.take_baselines(ticker, pairs)
+        for pair in pairs:
+            await self.handle_dexscreener_pair(pair, ticker, chains)
+
     async def _dexscreener_loop(self) -> None:
-        while True:
-            started = time.monotonic()
-            for ticker, chains in self.ticker_index().items():
+        semaphore = asyncio.Semaphore(DS_CONCURRENCY)
+
+        async def one(ticker: str, chains: set[str]) -> None:
+            async with semaphore:
                 try:
-                    pairs = await self.ds.search(ticker)
-                    if pairs is None:
-                        self.dexscreener_stats.error(f"recherche {ticker} sans réponse")
-                        continue
-                    self.dexscreener_stats.event()
-                    for pair in pairs:
-                        await self.handle_dexscreener_pair(pair, ticker, chains)
+                    await self.search_ticker(ticker, chains)
                 except Exception as exc:  # noqa: BLE001
                     self.dexscreener_stats.error(str(exc))
                     log.exception("dexscreener: recherche %s", ticker)
+
+        while True:
+            started = time.monotonic()
+            await asyncio.gather(*(one(t, c) for t, c in self.ticker_index().items()))
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(1.0, self.settings.dexscreener_interval - elapsed))
 
@@ -440,6 +593,7 @@ class Scanner:
             "liquidité": lambda: self._every(DS_LIQUIDITY_INTERVAL_S, self.check_pending_on_dexscreener,
                                              "dexscreener: liquidité"),
             "market caps": lambda: self._every(ENRICH_INTERVAL_S, self._enrich, "dexscreener: market caps"),
+            "anti-flood": lambda: self._every(FLOOD_SUMMARY_INTERVAL_S, self.flush_flood_summaries, "anti-flood"),
         }
         tasks = [asyncio.create_task(self._supervise(name, fn), name=name) for name, fn in loops.items()]
         try:

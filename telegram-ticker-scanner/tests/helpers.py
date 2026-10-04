@@ -36,6 +36,8 @@ class FakeEvmNode:
         self.receipts: dict[str, dict] = {}
         self.existing_contracts: set[str] = set()
         self.balances: dict[tuple[str, str], int] = {}
+        self.reserves: dict[str, tuple[int, int]] = {}
+        self.pair_tokens: dict[str, tuple[str, str, str]] = {}  # pair -> (token0, token1, factory)
         self.block = 0x100
         self.logs: list[dict] = []
         self.calls: list[tuple[str, Any]] = []
@@ -58,6 +60,15 @@ class FakeEvmNode:
             elif data.startswith(abi.SEL_BALANCE_OF):
                 holder = "0x" + data[-40:]
                 result = "0x" + uint_word(self.balances.get((to, holder), 0))
+            elif data == abi.SEL_GET_RESERVES:
+                r0, r1 = self.reserves.get(to, (0, 0))
+                result = "0x" + uint_word(r0) + uint_word(r1) + uint_word(0)
+            elif data in (abi.SEL_TOKEN0, abi.SEL_TOKEN1, abi.SEL_FACTORY):
+                if to not in self.pair_tokens:
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                     "error": {"code": 3, "message": "execution reverted"}})
+                idx = {abi.SEL_TOKEN0: 0, abi.SEL_TOKEN1: 1, abi.SEL_FACTORY: 2}[data]
+                result = "0x" + addr_word(self.pair_tokens[to][idx])
         elif method == "eth_getCode":
             result = "0x6080" if params[0].lower() in self.existing_contracts else "0x"
         elif method == "eth_getTransactionReceipt":
@@ -150,6 +161,7 @@ class FakeNotifier:
     def __init__(self):
         self.sent: list[tuple[Any, Any, list[str], str | None]] = []
         self.edits: list[tuple[Any, int]] = []
+        self.notices: list[tuple[Any, str]] = []
 
     async def send(self, entry, result, labels, note):
         self.sent.append((entry, result, labels, note))
@@ -157,6 +169,9 @@ class FakeNotifier:
 
     async def edit(self, entry, result, labels, note, message_id):
         self.edits.append((result, message_id))
+
+    async def notice(self, entry, text):
+        self.notices.append((entry, text))
 
 
 def make_settings(**kw) -> Settings:

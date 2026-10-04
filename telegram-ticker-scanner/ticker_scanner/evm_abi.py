@@ -15,15 +15,30 @@ V4_MODIFY_LIQUIDITY = keccak_hex("ModifyLiquidity(bytes32,address,int24,int24,in
 SOLIDLY_POOL_CREATED = keccak_hex("PoolCreated(address,address,bool,address,uint256)")
 SLIPSTREAM_POOL_CREATED = keccak_hex("PoolCreated(address,address,int24,address)")
 
+V2_MINT = keccak_hex("Mint(address,uint256,uint256)")
+V3_MINT = keccak_hex("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+
 SEL_SYMBOL = selector("symbol()")
 SEL_NAME = selector("name()")
 SEL_BALANCE_OF = selector("balanceOf(address)")
+SEL_TOKEN0 = selector("token0()")
+SEL_TOKEN1 = selector("token1()")
+SEL_FACTORY = selector("factory()")
+SEL_GET_RESERVES = selector("getReserves()")
+
+# Uniswap v2 (and forks) burn MINIMUM_LIQUIDITY LP tokens to the zero address on
+# the very first liquidity of a pair: a unique on-chain fingerprint.
+MINIMUM_LIQUIDITY = 1000
 
 
-def _hex_bytes(data: str | None) -> bytes:
-    if not data or data == "0x":
+def _hex_bytes(data) -> bytes:
+    """Hex string -> bytes; anything malformed (from an RPC node or a log) reads as empty."""
+    if not isinstance(data, str) or data in ("", "0x"):
         return b""
-    return bytes.fromhex(data[2:] if data.startswith("0x") else data)
+    try:
+        return bytes.fromhex(data[2:] if data.startswith("0x") else data)
+    except ValueError:
+        return b""
 
 
 def words(data: str | None) -> list[bytes]:
@@ -48,7 +63,9 @@ def word_address(data: str | None, index: int) -> str | None:
     return "0x" + w[index][12:].hex()
 
 
-def topic_address(topic: str) -> str:
+def topic_address(topic) -> str:
+    if not isinstance(topic, str):
+        return ZERO_ADDRESS
     return "0x" + topic[-40:].lower()
 
 

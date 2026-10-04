@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -18,6 +19,21 @@ STATUS_LIQ = "liq"     # liquidity added
 
 MAX_TICKERS = 3
 
+# Address formats. Everything coming from DexScreener / PumpPortal / RPC nodes
+# is validated against these before it is stored, linked or displayed.
+_EVM_ADDRESS = re.compile(r"^0x[0-9a-f]{40}$")
+_EVM_POOL_ID = re.compile(r"^0x[0-9a-f]{64}$")  # Uniswap v4 pool ids
+_SOLANA_ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def valid_address(kind: str, value: str | None, *, pool: bool = False) -> bool:
+    """`kind` is the chain kind ("evm" | "solana"); EVM values must be lowercased already."""
+    if not isinstance(value, str):
+        return False
+    if kind == "evm":
+        return bool(_EVM_ADDRESS.match(value) or (pool and _EVM_POOL_ID.match(value)))
+    return bool(_SOLANA_ADDRESS.match(value))
+
 
 # Bidi overrides / isolates can visually reorder a message (spoofing).
 _BIDI = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A), 0x200E, 0x200F, 0x061C)}
@@ -25,7 +41,7 @@ _BIDI = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A), 0x200E
 
 def clean_text(raw: str | None, max_len: int) -> str:
     """Strip control and bidi characters, collapse whitespace, truncate."""
-    if not raw:
+    if not raw or not isinstance(raw, (str, int, float)):
         return ""
     chars = []
     for ch in str(raw):
@@ -37,7 +53,7 @@ def clean_text(raw: str | None, max_len: int) -> str:
 
 
 def normalize_ticker(raw: str | None) -> str:
-    if not raw:
+    if not raw or not isinstance(raw, str):
         return ""
     t = unicodedata.normalize("NFKC", raw).strip().lstrip("$").strip()
     return "".join(t.split()).upper()
@@ -117,6 +133,8 @@ class Detection:
     liquidity_usd: float | None = None
     market_cap: float | None = None
     market_cap_note: str | None = None  # e.g. "32.5 SOL" when USD is unknown
+    # Liquidity landed on a pair that existed before we saw it: notify 🟢 only.
+    pre_existing_pair: bool = False
     created_at: float = field(default_factory=time.time)
 
     @property

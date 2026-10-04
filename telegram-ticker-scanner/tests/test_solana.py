@@ -140,15 +140,15 @@ class SolanaSourcesTest(unittest.IsolatedAsyncioTestCase):
     async def test_pumpportal_create_and_migration(self):
         pp = PumpPortalWatcher(self.scanner)
         await pp.handle({"txType": "create", "mint": MINT, "symbol": "ABC", "name": "Abc", "pool": "pump",
-                         "bondingCurveKey": "Curve111", "marketCapSol": 31.5, "signature": "s"})
-        await pp.handle({"txType": "create", "mint": "Other1111", "symbol": "NOPE", "pool": "pump"})
+                         "bondingCurveKey": "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf", "marketCapSol": 31.5, "signature": "s"})
+        await pp.handle({"txType": "create", "mint": "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1", "symbol": "NOPE", "pool": "pump"})
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 1)
         _, res, labels, note = self.notifier.sent[0]
         self.assertEqual((labels, res.dex, note), (["launch"], "pump.fun", "31.5 SOL"))
         # migration -> the new PumpSwap pool is looked up on DexScreener
         self.ds.token_pairs[MINT] = [{
-            "chainId": "solana", "dexId": "pumpswap", "pairAddress": "Pool111", "pairCreatedAt": 1,
+            "chainId": "solana", "dexId": "pumpswap", "pairAddress": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2", "pairCreatedAt": 1,
             "baseToken": {"address": MINT, "symbol": "ABC", "name": "Abc"},
             "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
             "liquidity": {"usd": 25000}, "marketCap": 70000,
@@ -159,7 +159,7 @@ class SolanaSourcesTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
         await drain(self.scanner)
         _, res, labels, _ = self.notifier.sent[1]
-        self.assertEqual((labels, res.pair_address, res.market_cap), (["pair", "liq"], "Pool111", 70000))
+        self.assertEqual((labels, res.pair_address, res.market_cap), (["pair", "liq"], "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2", 70000))
 
 
 if __name__ == "__main__":

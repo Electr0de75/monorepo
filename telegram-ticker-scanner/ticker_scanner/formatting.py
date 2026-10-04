@@ -186,7 +186,8 @@ def entry_card(entry: Entry, total: int, liquid: int, realtime: dict[str, bool],
     rows = [
         [{"text": f"📋 Résultats ({total})", "callback_data": f"{CB}r:{entry.id}:0"}],
         [
-            {"text": "▶️ Reprendre" if entry.paused else "⏸ Pause", "callback_data": f"{CB}p:{entry.id}"},
+            {"text": "▶️ Reprendre" if entry.paused else "⏸ Pause",
+             "callback_data": f"{CB}p:{entry.id}:{0 if entry.paused else 1}"},
             {"text": "✏️ Modifier", "callback_data": f"{CB}ed:{entry.id}"},
         ],
         [{"text": "🗑 Supprimer", "callback_data": f"{CB}d:{entry.id}"}],
@@ -263,7 +264,7 @@ def results_page(entry: Entry, results: list[Result], page: int, page_size: int,
             numbers = "💧 Liq : pas encore ajoutée"
         else:
             numbers = f"💧 Liq {fmt_usd(res.liquidity_usd)} · 📊 MC {fmt_usd(res.market_cap)}"
-        link_line = " | ".join(f'<a href="{esc(url)}">{name}</a>' for name, url in links(res))
+        link_line = " | ".join(f'<a href="{html.escape(url, quote=True)}">{name}</a>' for name, url in links(res))
         title = f"<b>{i}.</b> {STATUS_EMOJI.get(res.status, '•')} <b>${esc(res.symbol)}</b>"
         if res.name:
             title += f" · {esc(res.name)}"

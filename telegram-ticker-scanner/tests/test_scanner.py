@@ -17,7 +17,8 @@ def ds_pair(created_s: float, liq: float | None = 5000, dex="pancakeswap", label
             symbol="ABC", chain="bsc", token=TOKEN):
     return {
         "chainId": chain, "dexId": dex, "labels": list(labels), "pairAddress": pair,
-        "baseToken": {"address": token.upper().replace("0X", "0x"), "symbol": symbol, "name": "Abc"},
+        "baseToken": {"address": token.upper().replace("0X", "0x") if token.startswith("0x") else token,
+                      "symbol": symbol, "name": "Abc"},
         "quoteToken": {"address": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", "symbol": "WBNB"},
         "liquidity": {"usd": liq} if liq is not None else None, "marketCap": 100000, "fdv": 100000,
         "pairCreatedAt": int(created_s * 1000),
@@ -57,7 +58,7 @@ class ScannerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_dexscreener_launchpad_dex_id(self):
         await self.scanner.handle_dexscreener_pair(
-            ds_pair(time.time(), dex="pumpfun", labels=(), pair="Curve1", chain="solana", token="Mint1"),
+            ds_pair(time.time(), dex="pumpfun", labels=(), pair="4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf", chain="solana", token="7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"),
             "ABC", {"solana"})
         await drain(self.scanner)
         self.assertEqual(self.notifier.sent[0][2], ["launch"])

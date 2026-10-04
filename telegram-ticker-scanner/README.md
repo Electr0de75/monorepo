@@ -77,7 +77,13 @@ Chaque chaîne est scannée via **DexScreener** (toutes les chaînes, sans clé,
 
 **« Tout nouveau token »** (EVM) : le scanner écoute toutes les créations de tokens ERC-20 de la chaîne. Il détecte donc les tokens de **n'importe quel launchpad**, même inconnu. Quand l'adresse du launchpad est connue (Pons, PAIR, Flap, four.meme), son nom s'affiche. Sinon tu vois `Nouveau token · via 0x1234…abcd`, c'est-à-dire le contrat appelé.
 
-**Liquidité** : après un 🟡 PAIR CREATED, le scanner surveille la pair pendant 72 h et t'envoie 🟢 LIQ ADDED dès que de la liquidité arrive.
+**Liquidité** : après un 🟡 PAIR CREATED, le scanner surveille la pair pendant 72 h et t'envoie 🟢 LIQ ADDED dès que de la liquidité réelle arrive. Pour les pairs v2, il vérifie les réserves, et pas seulement des jetons envoyés à la pair.
+
+**Lancement furtif** : l'équipe crée la pair des jours avant et n'ajoute la liquidité qu'au lancement. Le scanner l'attrape même si la pair existait avant ton projet :
+- **en temps réel on-chain** : la toute première liquidité d'une pair v2 (Uniswap, PancakeSwap, SushiSwap et leurs forks, même une factory inconnue) laisse une empreinte unique. Le scanner la repère et envoie 🟢 LIQ ADDED ;
+- **via DexScreener** : à l'ajout d'un ticker, le scanner photographie les pairs déjà existantes. Toute pair absente de cette photo qui apparaît ensuite est signalée, même si sa date de création est ancienne.
+
+**Anti-flood** : quand un ticker est à la mode, des dizaines de copies sortent en quelques minutes. Au-delà de 15 alertes en 10 min pour un même projet, les suivantes sont regroupées dans un résumé. Celles avec plus de 10 000 $ de liquidité passent toujours, et tout reste dans 📋 Résultats. Les deux seuils se règlent dans `.env`.
 
 Pour ajouter une chaîne EVM au temps réel, il suffit d'une entrée `Chain(...)` dans `ticker_scanner/chains.py` (adresses des factories) et des variables `<CHAÎNE>_WS_URL` dans `.env`.
 
@@ -121,8 +127,9 @@ Si ton bot lit déjà des commandes Telegram, Telegram refuse que deux programme
 ## Bon à savoir
 
 - **Correspondance des tickers** : exacte, sans tenir compte des majuscules ni du `$` (`$moon` = `MOON`).
-- **Copies du même ticker** : elles sont **toutes** notifiées, et sur Solana et Robinhood il y en a souvent plusieurs. Le market cap, la liquidité et le launchpad t'aident à repérer le vrai.
-- **Paires antérieures** : les paires créées avant l'ajout du projet ne sont pas notifiées.
+- **Copies du même ticker** : elles sont toutes enregistrées. Les notifications sont regroupées en cas de rafale (voir Anti-flood). Le market cap, la liquidité et le launchpad t'aident à repérer le vrai token.
+- **Paires antérieures** : les pairs qui existaient déjà avec de la liquidité avant l'ajout du projet ne sont pas notifiées. Les lancements furtifs le sont.
+- **Groupes** : le bot ne répond qu'aux comptes listés dans `TELEGRAM_ALLOWED_USERS`, et ignore `/scanner@AutreBot`.
 - **Adresses à vérifier** : les adresses des factories et launchpads viennent de sources publiques (docs Uniswap, Bitquery, BscScan…). Le scanner n'a pas pu être lancé contre les vraies blockchains depuis l'environnement où il a été écrit, faute d'accès réseau. Au premier lancement, regarde les logs (`watcher on-chain démarré`, `websocket connecté`). En cas de souci, `LOG_LEVEL=DEBUG` donne le détail.
 - **Lien Defined pour Robinhood** : il utilise le slug `robinhood`. S'il ne fonctionne pas, corrige `defined=` dans `chains.py`.
 
@@ -131,7 +138,8 @@ Si ton bot lit déjà des commandes Telegram, Telegram refuse que deux programme
 Le scanner est conçu pour tourner des semaines sans surveillance.
 
 - **Reconnexion automatique** de chaque websocket, avec un délai croissant. Une connexion restée muette 2 à 3 minutes (fournisseur qui ne transmet plus rien sans couper) est rouverte.
-- **Rattrapage** : après une coupure, les blocs manqués sont relus via `eth_getLogs`. Si le RPC refuse une plage trop grande, elle est découpée automatiquement.
+- **Rattrapage** : après une coupure, les 10 dernières minutes sont relues via `eth_getLogs`, quelle que soit la vitesse des blocs (6 000 blocs sur Robinhood). Si le RPC refuse une plage trop grande, elle est découpée automatiquement. Quand le fournisseur annonce sa limite (« up to a 10 block range »), elle est reprise telle quelle.
+- **Reconnexion immédiate** quand la connexion précédente transmettait des données. Le délai croissant ne s'applique qu'aux échecs répétés.
 - **Erreurs RPC triées** : un rate-limit ou une panne réseau déclenche un nouvel essai. Un token n'est jamais écarté à tort parce que le RPC était saturé.
 - **Notifications** :
   - nouvel essai en cas de coupure réseau ;
@@ -142,18 +150,32 @@ Le scanner est conçu pour tourner des semaines sans surveillance.
 - **Vérification au démarrage** :
   - le token Telegram ;
   - le chain ID de chaque RPC. Une URL Ethereum mise par erreur dans `BSC_WS_URL` désactive le temps réel BSC, avec un avertissement dans 🩺 État.
-- **Secrets masqués** : le token du bot et les clés API sont remplacés par `***` dans les logs.
+- **Secrets masqués** : le token du bot et les clés API sont remplacés par `***` dans les logs et sur la page 🩺 État. Un avertissement s'affiche si `.env` est lisible par d'autres utilisateurs (`chmod 600 .env`).
+- **Données externes validées** : toute adresse venant de DexScreener, PumpPortal ou d'un RPC doit avoir un format EVM ou Solana strict, sinon elle est rejetée. Une donnée forgée ne peut donc ni casser l'affichage ni injecter un lien.
 - **Noms de tokens piégés** : caractères de contrôle et inversion du sens du texte sont retirés, et les noms sont tronqués.
+- **Clics rejoués** : la position de lecture Telegram est mémorisée et les boutons portent l'état voulu. Un redémarrage ne rejoue donc jamais un clic (par exemple réactiver un projet en pause). Un ancien sélecteur de chaînes ne peut pas modifier le mauvais projet.
 - **Configuration** : une valeur invalide dans `.env` est signalée au démarrage avec un message clair.
 - **Arrêt propre** sur Ctrl+C ou SIGTERM (Docker, Railway, systemd).
 - **Redémarrage** : si l'ancienne instance occupe encore Telegram quelques secondes, le menu réessaie au lieu de se désactiver.
+
+## Performance
+
+- **Latence** :
+  - **EVM** : les appels RPC nécessaires après un ticker reconnu (nom, contrôle de nouveauté, reçu) partent en parallèle. Le reçu est mis en cache et partagé entre les détecteurs. Les events de pairs passent avant le flux de mints.
+  - **DexScreener** : jusqu'à 4 recherches en parallèle, dans la limite de 250 requêtes/min.
+- **Débit mesuré** : environ 2 800 logs EVM/s et environ 3 600 transactions Solana/s analysées. Il faut exactement 1 appel RPC par nouveau token, et 0 pour un token déjà vu.
+- **Mémoire bornée** : environ 35 Mo maximum par chaîne, quelle que soit la durée de fonctionnement.
+- **Accélérateurs optionnels** : `pip install uvloop orjson`. Ils sont utilisés automatiquement s'ils sont installés.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -t .
+FUZZ_ITERATIONS=20000 python -m unittest tests.test_fuzz   # fuzzing approfondi
 ```
 
-Les 87 tests passent sur Python 3.10, 3.11, 3.12 et 3.13. Ils simulent le RPC EVM, les websockets, DexScreener, PumpPortal, Solana et Telegram, et couvrent :
-- un scénario de bout en bout : création d'un projet depuis Telegram, démarrage des sources, notification reçue ;
-- chaque correction de robustesse : coupures, rate-limits, annulations concurrentes, payloads malformés, conflits Telegram.
+Les 124 tests passent sur Python 3.10, 3.11, 3.12 et 3.13. Ils simulent le RPC EVM, les websockets, DexScreener, PumpPortal, Solana et Telegram, et couvrent :
+- **bout en bout** : création d'un projet depuis Telegram, démarrage des sources, notification reçue ;
+- **chaos** : l'application complète contre des services qui tombent en panne au hasard (environ 30 % d'erreurs 5xx, 429 et réseau), avec websockets coupés et événements rejoués. La notification arrive exactement une fois, rien ne plante ;
+- **fuzzing** : des milliers d'entrées aléatoires et malveillantes envoyées à chaque parseur et à chaque point d'entrée (logs EVM, transactions Solana, PumpPortal, DexScreener, updates Telegram). Aucun plantage, et le HTML produit est toujours valide pour Telegram ;
+- **robustesse et sécurité** : coupures, rate-limits, annulations concurrentes, conflits Telegram, adresses forgées, secrets, lancements furtifs, anti-flood.

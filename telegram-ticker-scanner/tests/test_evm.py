@@ -76,11 +76,15 @@ class EvmWatcherTest(unittest.IsolatedAsyncioTestCase):
         await self.watcher.check_pending_liquidity(now)
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 1)
-        self.node.balances[(TOKEN, PAIR)] = 10 ** 18
-        await self.watcher.check_pending_liquidity(now + 1)  # too soon: not checked again
+        self.node.balances[(TOKEN, PAIR)] = 10 ** 18  # tokens sent to the pair: not liquidity yet
+        await self.watcher.check_pending_liquidity(now + 7)
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 1)
-        await self.watcher.check_pending_liquidity(now + 7)
+        self.node.reserves[PAIR] = (10 ** 18, 5 * 10 ** 17)
+        await self.watcher.check_pending_liquidity(now + 8)  # too soon: not checked again
+        await drain(self.scanner)
+        self.assertEqual(len(self.notifier.sent), 1)
+        await self.watcher.check_pending_liquidity(now + 14)
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 2)
         self.assertEqual(self.notifier.sent[1][2], ["liq"])
@@ -92,7 +96,11 @@ class EvmWatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.notifier.sent), 2)
 
     async def test_pair_with_liquidity_in_same_tx(self):
-        self.node.receipts["0xtx1"] = {"to": "0xrouter", "logs": [transfer_log(TOKEN, "0x" + "c3" * 20, PAIR, 5, "0xtx1")]}
+        self.node.receipts["0xtx1"] = {"to": "0xrouter", "logs": [
+            transfer_log(TOKEN, "0x" + "c3" * 20, PAIR, 5, "0xtx1"),
+            {"address": PAIR, "topics": [abi.V2_MINT, "0x" + addr_word("0x" + "c3" * 20)],
+             "data": "0x" + uint_word(5) + uint_word(7)},
+        ]}
         await self.watcher.handle_pair(pair_created_log(WBNB, TOKEN, PAIR))
         await drain(self.scanner)
         self.assertEqual(self.notifier.sent[0][2], ["pair", "liq"])

@@ -51,9 +51,10 @@ class BotTest(unittest.IsolatedAsyncioTestCase):
         await self.bot.handle_update(msg("/nouveau"))
         await self.bot.handle_update(msg(name))
         await self.bot.handle_update(msg(tickers))
-        await self.bot.handle_update(cb("ct:solana"))
-        await self.bot.handle_update(cb("ct:robinhood"))
-        await self.bot.handle_update(cb("cv"))
+        picker = self.tg.next_message_id  # clicks come from the picker message itself
+        await self.bot.handle_update(cb("ct:solana", picker))
+        await self.bot.handle_update(cb("ct:robinhood", picker))
+        await self.bot.handle_update(cb("cv", picker))
         return self.scanner.db.list_entries()[-1]
 
     async def test_unknown_user_gets_his_id_only_when_unconfigured(self):
@@ -78,11 +79,12 @@ class BotTest(unittest.IsolatedAsyncioTestCase):
         await self.bot.handle_update(msg("A B C D"))
         self.assertIn("entre 1 et 3 tickers", self.last_text())
         await self.bot.handle_update(msg("A"))
-        await self.bot.handle_update(cb("cv"))
+        picker = self.tg.next_message_id
+        await self.bot.handle_update(cb("cv", picker))
         answer = self.tg.of("answerCallbackQuery")[-1]
         self.assertTrue(answer["show_alert"])
-        await self.bot.handle_update(cb("ca:evm"))
-        await self.bot.handle_update(cb("cv"))
+        await self.bot.handle_update(cb("ca:evm", picker))
+        await self.bot.handle_update(cb("cv", picker))
         entry = self.scanner.db.list_entries()[-1]
         self.assertIn("bsc", entry.chains)
         self.assertNotIn("solana", entry.chains)

@@ -18,9 +18,9 @@ def message(update_id, text):
     return {"update_id": update_id, "message": {"from": {"id": 42}, "chat": {"id": 42}, "text": text}}
 
 
-def click(update_id, data):
+def click(update_id, data, message_id=1):
     return {"update_id": update_id, "callback_query": {"id": str(update_id), "from": {"id": 42}, "data": data,
-                                                       "message": {"message_id": 1, "chat": {"id": 42}}}}
+                                                       "message": {"message_id": message_id, "chat": {"id": 42}}}}
 
 
 class EndToEndTest(unittest.IsolatedAsyncioTestCase):
@@ -48,13 +48,14 @@ class EndToEndTest(unittest.IsolatedAsyncioTestCase):
             scanner.ws_connect = connect
             bot = BotUI(api, scanner.db, scanner, settings)
             ds.search_results["MOON"] = [{
-                "chainId": "solana", "dexId": "raydium", "labels": ["CPMM"], "pairAddress": "PoolX",
-                "baseToken": {"address": "MintX", "symbol": "MOON", "name": "Moon"},
+                "chainId": "solana", "dexId": "raydium", "labels": ["CPMM"], "pairAddress": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+                "baseToken": {"address": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", "symbol": "MOON", "name": "Moon"},
                 "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
                 "liquidity": {"usd": 30000}, "marketCap": 250000, "pairCreatedAt": int(time.time() * 1000) + 60_000,
             }]
+            picker = tg.next_message_id + 3  # 3rd message sent by the bot is the chain picker
             tg.updates = [message(1, "/nouveau"), message(2, "Projet test"), message(3, "$moon"),
-                          click(4, "sc:ct:solana"), click(5, "sc:ct:bsc"), click(6, "sc:cv")]
+                          click(4, "sc:ct:solana", picker), click(5, "sc:ct:bsc", picker), click(6, "sc:cv", picker)]
             run = asyncio.create_task(scanner.run())
             poll = asyncio.create_task(bot.run_polling())
             try:
@@ -72,7 +73,7 @@ class EndToEndTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sorted(sockets), ["wss://pumpportal.fun/api/data", "wss://rpc.test", "wss://sol.test"])
             notif = next(b for b in tg.of("sendMessage") if b["text"].startswith("<pre>"))
             self.assertIn("🟡 PAIR CREATED + 🟢 LIQ ADDED", notif["text"])
-            self.assertIn("<code>MintX</code>", notif["text"])
+            self.assertIn("<code>7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU</code>", notif["text"])
 
 
 if __name__ == "__main__":

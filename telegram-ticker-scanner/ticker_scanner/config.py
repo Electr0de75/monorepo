@@ -16,6 +16,24 @@ try:  # optional dependency
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def env_file_path() -> str | None:
+    """The .env to use: the current directory's first, else the project's."""
+    for candidate in (os.path.join(os.getcwd(), ".env"), os.path.join(PROJECT_DIR, ".env")):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_env_file() -> str | None:
+    """Load the .env (never overriding variables already set). Returns its path."""
+    path = env_file_path()
+    if path and load_dotenv is not None:
+        load_dotenv(path, override=False)
+    return path
+
 
 @dataclass
 class EvmRpc:
@@ -35,7 +53,7 @@ class Settings:
     timezone: str = "Europe/Paris"
     db_path: str = "ticker_scanner.db"
     evm_rpc: dict[str, EvmRpc] = field(default_factory=dict)
-    evm_getlogs_max_range: int = 10
+    evm_getlogs_max_range: int = 2000  # starting eth_getLogs range, lowered automatically if refused
     evm_poll_interval: float = 2.0
     evm_liquidity_check_interval: float = 6.0
     pumpportal_enabled: bool = True
@@ -43,6 +61,8 @@ class Settings:
     solana_http_url: str | None = None
     dexscreener_interval: float = 15.0
     pending_liquidity_max_age_h: float = 72.0
+    notify_flood_limit: int = 15             # alerts per entry per 10 min (0 = unlimited)
+    notify_flood_bypass_liq_usd: float = 10_000.0
     results_page_size: int = 5
 
     @property
@@ -104,8 +124,7 @@ def _derive_http(ws_url: str | None) -> str | None:
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
     if env is None:
-        if load_dotenv is not None:
-            load_dotenv()
+        load_env_file()
         env = dict(os.environ)
 
     token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -146,7 +165,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         timezone=timezone,
         db_path=env.get("DB_PATH", "ticker_scanner.db").strip() or "ticker_scanner.db",
         evm_rpc=evm_rpc,
-        evm_getlogs_max_range=_number(env, "EVM_GETLOGS_MAX_RANGE", 10, int, 1),
+        evm_getlogs_max_range=_number(env, "EVM_GETLOGS_MAX_RANGE", 2000, int, 1),
         evm_poll_interval=_number(env, "EVM_POLL_INTERVAL", 2, float, 0.2),
         evm_liquidity_check_interval=_number(env, "EVM_LIQUIDITY_CHECK_INTERVAL", 6, float, 1),
         pumpportal_enabled=_bool(env.get("PUMPPORTAL_ENABLED"), True),
@@ -154,4 +173,6 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         solana_http_url=solana_http,
         dexscreener_interval=_number(env, "DEXSCREENER_INTERVAL", 15, float, 2),
         pending_liquidity_max_age_h=_number(env, "PENDING_LIQUIDITY_MAX_AGE_H", 72, float, 1),
+        notify_flood_limit=_number(env, "NOTIFY_FLOOD_LIMIT", 15, int, 0),
+        notify_flood_bypass_liq_usd=_number(env, "NOTIFY_FLOOD_BYPASS_LIQ_USD", 10_000, float, 0),
     )

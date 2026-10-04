@@ -2,15 +2,18 @@
 
 Per chain it follows three log streams:
 
-* ``mints``  – every ERC-20 ``Transfer(from=0x0)``: catches every new token,
-  whatever the launchpad (Pons, LONG, o1, PAIR, Flap, four.meme, …) or a
-  direct deployment.
-* ``pairs``  – PairCreated / PoolCreated / Initialize on the DEX factories.
+* ``mints``  – every ERC-20 ``Transfer(from=0x0)``. It catches every new token,
+  whatever the launchpad (Pons, LONG, o1, PAIR, Flap, four.meme, …) or a direct
+  deployment, and the very first liquidity of any Uniswap-v2-style pair (the
+  MINIMUM_LIQUIDITY burn), even for a pair created long before (stealth launch)
+  or by an unknown factory.
+* ``pairs``  – PairCreated / PoolCreated / Initialize on the known DEX factories.
 * ``v4liq``  – ModifyLiquidity on Uniswap v4 for pools still waiting for
-  liquidity (v2/v3-style pools are checked with ``balanceOf(pool)``).
+  liquidity (v2/v3-style pools are polled: reserves / pool balance).
 
 Logs come from ``eth_subscribe`` when a websocket URL is configured, else from
-``eth_getLogs`` polling. Pair events are processed before mint events.
+``eth_getLogs`` polling. Pair events are processed before mint events and the
+RPC calls needed once a ticker matches run in parallel.
 """
 
 from __future__ import annotations
@@ -18,9 +21,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import re
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -28,7 +32,7 @@ from . import evm_abi as abi
 from .chains import Chain
 from .config import EvmRpc, Settings
 from .health import SourceStats
-from .models import LAUNCH, LIQUIDITY, PAIR, Detection
+from .models import LAUNCH, LIQUIDITY, PAIR, Detection, valid_address
 from .rpc import NODE, REVERT, HttpRpc, RpcError, WsSubscriptions, cancel_requested
 
 if TYPE_CHECKING:
@@ -36,13 +40,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MAX_BACKFILL_BLOCKS = 600
-BALANCE_POOL_KINDS = ("v2", "v3", "solidly", "slipstream")
+BACKFILL_WINDOW_S = 600        # how far back we catch up after a disconnection
+MAX_BACKFILL_BLOCKS = 20_000
+RESERVES_POOL_KINDS = ("v2", "solidly")
+BALANCE_POOL_KINDS = ("v3", "slipstream")
 WS_STALL_TIMEOUT_S = 180
 # Priority of each stream in the work queue (lower = first).
 PRIORITY = {"pairs": 0, "v4liq": 0, "mints": 1}
 # How often a pool still waiting for liquidity is checked, by age.
 PENDING_SCHEDULE = ((600, 6.0), (3600, 30.0), (float("inf"), 120.0))
+RANGE_GROWTH_STREAK = 50       # successful eth_getLogs before trying a larger range again
 
 
 class LRU(OrderedDict):
@@ -57,17 +64,57 @@ class LRU(OrderedDict):
             self.popitem(last=False)
 
 
-def _hex_int(value: str | None) -> int:
-    if not value or value == "0x":
+class BoundedSet:
+    """Membership set that forgets its oldest half when full (O(1), no per-item bookkeeping)."""
+
+    def __init__(self, maxsize: int):
+        self.half = max(1, maxsize // 2)
+        self._new: set = set()
+        self._old: set = set()
+
+    def __contains__(self, key) -> bool:
+        return key in self._new or key in self._old
+
+    def __len__(self) -> int:
+        return len(self._new) + len(self._old)
+
+    def add(self, key) -> None:
+        self._new.add(key)
+        if len(self._new) >= self.half:
+            self._old, self._new = self._new, set()
+
+    def discard(self, key) -> None:
+        self._new.discard(key)
+        self._old.discard(key)
+
+
+def _hex_int(value: Any) -> int:
+    if not isinstance(value, str) or value in ("", "0x"):
         return 0
     try:
         return int(value, 16)
-    except (TypeError, ValueError):
+    except ValueError:
         return 0
 
 
 def short(addr: str) -> str:
     return f"{addr[:6]}…{addr[-4:]}"
+
+
+_RANGE_HINT = re.compile(r"(?:up to an?|limited to an?|maximum(?: of)?|max(?:imum)? range(?: of)?)\s*([\d,]+)\s*(?:-\s*)?block",
+                         re.IGNORECASE)
+
+
+def range_hint(message: str) -> int | None:
+    """Block range limit announced in a provider's eth_getLogs error, if any."""
+    m = _RANGE_HINT.search(message)
+    if not m:
+        return None
+    try:
+        value = int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return value if value >= 1 else None
 
 
 def pending_interval(age_s: float) -> float:
@@ -90,8 +137,10 @@ class EvmWatcher:
         self.n_workers = workers
         self.stats = stats or SourceStats(f"evm:{chain.key}")
         self.stats.mode = "websocket" if self.ws_url else "polling HTTP"
-        self.symbols: LRU = LRU(200_000)       # address -> symbol ("" = not a token)
-        self.seen_mints: LRU = LRU(500_000)    # token addresses already processed
+        self.symbols: LRU = LRU(50_000)                 # address -> symbol ("" = not a token)
+        self.seen_mints = BoundedSet(200_000)           # token contracts already processed
+        self.seen_first_liq = BoundedSet(50_000)        # v2 pairs whose first liquidity was handled
+        self._receipts: LRU = LRU(256)
         self._inflight: dict[str, asyncio.Future] = {}
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=50_000)
         self._seq = itertools.count()
@@ -100,6 +149,9 @@ class EvmWatcher:
         self.filters: dict[str, dict | None] = {}
         self._ws: WsSubscriptions | None = None
         self._next_check: dict[int, float] = {}
+        self.max_range = max(1, settings.evm_getlogs_max_range)
+        self._range_cap = self.max_range  # hard limit announced by the provider, if any
+        self._range_streak = 0
 
         self.dex_by_address: dict[str, tuple[str, str]] = {}
         for kind, table in (
@@ -108,6 +160,10 @@ class EvmWatcher:
         ):
             for address, name in table.items():
                 self.dex_by_address[address] = (kind, name)
+
+    @property
+    def backfill_blocks(self) -> int:
+        return min(MAX_BACKFILL_BLOCKS, max(100, int(BACKFILL_WINDOW_S / max(self.chain.block_time, 0.05))))
 
     # ---- filters -------------------------------------------------------
     def base_filters(self) -> dict[str, dict]:
@@ -168,7 +224,7 @@ class EvmWatcher:
     def _on_ws_message(self, name: str, lg: dict) -> None:
         self._enqueue(name, lg, track=True)
 
-    def _enqueue(self, name: str, lg: dict, track: bool) -> None:
+    def _enqueue(self, name: str, lg: Any, track: bool) -> None:
         if not isinstance(lg, dict) or lg.get("removed"):
             return
         self.stats.event()
@@ -184,9 +240,9 @@ class EvmWatcher:
                 log.warning("[%s] file pleine, %d logs ignorés", self.chain.key, self._dropped)
 
     async def _get_logs(self, flt: dict, start: int, end: int) -> list[dict]:
-        """eth_getLogs that splits the range when the node refuses it (too large / too many results)."""
+        """eth_getLogs that splits a range the node refuses and learns the provider's limit."""
         try:
-            return await self.rpc.call("eth_getLogs", [{**flt, "fromBlock": hex(start), "toBlock": hex(end)}]) or []
+            logs = await self.rpc.call("eth_getLogs", [{**flt, "fromBlock": hex(start), "toBlock": hex(end)}])
         except RpcError as exc:
             if exc.kind != NODE:
                 raise  # network / rate limit: retry the same range later
@@ -194,14 +250,29 @@ class EvmWatcher:
                 log.warning("[%s] eth_getLogs refusé pour le bloc %d, ignoré: %s", self.chain.key, start, exc)
                 self.stats.error(str(exc))
                 return []
+            self._range_streak = 0
+            hint = range_hint(str(exc))
+            if hint and hint < end - start + 1:
+                # The provider told us its limit ("up to a 10 block range"): use it exactly, for good.
+                self._range_cap = min(self._range_cap, hint)
+                self.max_range = min(self.max_range, hint)
+                out: list[dict] = []
+                for a in range(start, end + 1, hint):
+                    out += await self._get_logs(flt, a, min(end, a + hint - 1))
+                return out
+            self.max_range = max(1, min(self.max_range, (end - start + 1) // 2))
             mid = (start + end) // 2
             return await self._get_logs(flt, start, mid) + await self._get_logs(flt, mid + 1, end)
+        self._range_streak += 1
+        if self._range_streak >= RANGE_GROWTH_STREAK and self.max_range < self._range_cap:
+            self.max_range = min(self._range_cap, self.max_range * 2)  # limit was guessed: probe upwards
+            self._range_streak = 0
+        return logs if isinstance(logs, list) else []
 
     async def _fetch_range(self, start: int, end: int) -> None:
-        step = max(1, self.settings.evm_getlogs_max_range)
         a = start
         while a <= end:
-            b = min(end, a + step - 1)
+            b = min(end, a + self.max_range - 1)
             for name, flt in list(self.filters.items()):
                 if not flt:
                     continue
@@ -211,10 +282,10 @@ class EvmWatcher:
 
     def _range_start(self, since: int, latest: int) -> int:
         start = since + 1
-        if latest - start > MAX_BACKFILL_BLOCKS:
-            skipped = latest - MAX_BACKFILL_BLOCKS - start
+        if latest - start > self.backfill_blocks:
+            skipped = latest - self.backfill_blocks - start
             log.warning("[%s] retard de %d blocs, les plus anciens sont ignorés", self.chain.key, skipped)
-            start = latest - MAX_BACKFILL_BLOCKS
+            start = latest - self.backfill_blocks
         return start
 
     async def _backfill(self) -> None:
@@ -262,7 +333,10 @@ class EvmWatcher:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] erreur sur un log %s", self.chain.key, name)
 
-    # ---- token metadata ------------------------------------------------
+    # ---- chain reads ---------------------------------------------------
+    async def _call(self, to: str, data: str) -> str | None:
+        return await self.rpc.call("eth_call", [{"to": to, "data": data}, "latest"])
+
     async def token_symbol(self, address: str) -> str:
         address = address.lower()
         if address in self.chain.quote_tokens:
@@ -277,8 +351,7 @@ class EvmWatcher:
         self._inflight[address] = fut
         symbol = ""
         try:
-            res = await self.rpc.call("eth_call", [{"to": address, "data": abi.SEL_SYMBOL}, "latest"])
-            symbol = abi.decode_string_result(res) or ""
+            symbol = abi.decode_string_result(await self._call(address, abi.SEL_SYMBOL)) or ""
             self.symbols.put(address, symbol)
         except RpcError as exc:
             if exc.kind == REVERT:  # symbol() reverted: not an ERC-20
@@ -292,10 +365,31 @@ class EvmWatcher:
 
     async def token_name(self, address: str) -> str:
         try:
-            res = await self.rpc.call("eth_call", [{"to": address, "data": abi.SEL_NAME}, "latest"])
-            return abi.decode_string_result(res) or ""
+            return abi.decode_string_result(await self._call(address, abi.SEL_NAME)) or ""
         except RpcError:
             return ""
+
+    async def _address_call(self, to: str, data: str) -> str | None:
+        try:
+            address = abi.word_address(await self._call(to, data), 0)
+        except RpcError:
+            return None
+        return address if valid_address("evm", address) else None
+
+    async def receipt(self, tx_hash: str | None) -> dict:
+        """Transaction receipt, cached: several handlers need the same one."""
+        if not tx_hash:
+            return {}
+        if tx_hash in self._receipts:
+            return self._receipts[tx_hash]
+        try:
+            rec = await self.rpc.call("eth_getTransactionReceipt", [tx_hash])
+        except RpcError:
+            return {}
+        if isinstance(rec, dict):
+            self._receipts.put(tx_hash, rec)
+            return rec
+        return {}
 
     async def _is_new_contract(self, address: str, block_hex: str | None) -> bool:
         """False when the contract already existed before this block (old token minting)."""
@@ -311,22 +405,19 @@ class EvmWatcher:
     async def _launchpad_label(self, tx_hash: str | None, minted_to: str | None) -> str:
         if minted_to and minted_to in self.chain.launchpads:
             return self.chain.launchpads[minted_to]
-        if not tx_hash:
-            return "Nouveau token"
-        try:
-            receipt = await self.rpc.call("eth_getTransactionReceipt", [tx_hash]) or {}
-        except RpcError:
+        receipt = await self.receipt(tx_hash)
+        if not receipt:
             return "Nouveau token"
         to = (receipt.get("to") or "").lower()
         if to in self.chain.launchpads:
             return self.chain.launchpads[to]
-        for lg in receipt.get("logs", []):
+        for lg in receipt.get("logs") or []:
             emitter = (lg.get("address") or "").lower()
             if emitter in self.chain.launchpads:
                 return self.chain.launchpads[emitter]
             if emitter in self.dex_by_address:
                 return f"Nouveau token · {self.dex_by_address[emitter][1]}"
-        if to:
+        if valid_address("evm", to):
             return f"Nouveau token · via {short(to)}"
         return "Nouveau token · déploiement direct"
 
@@ -336,25 +427,70 @@ class EvmWatcher:
         if len(topics) != 3:  # ERC-721 mints have 4 topics
             return
         token = (lg.get("address") or "").lower()
-        if not token or token in self.seen_mints or token in self.chain.quote_tokens:
+        if not valid_address("evm", token) or token in self.chain.quote_tokens:
             return
-        self.seen_mints.put(token, True)
+        minted_to = abi.topic_address(topics[2])
+        if minted_to == abi.ZERO_ADDRESS and abi.word_uint(lg.get("data"), 0) == abi.MINIMUM_LIQUIDITY:
+            if token not in self.seen_first_liq:
+                self.seen_first_liq.add(token)
+                await self.handle_first_liquidity(token, lg)
+            return
+        if token in self.seen_mints:
+            return
+        self.seen_mints.add(token)
         symbol = await self.token_symbol(token)
         if token not in self.symbols:  # RPC failure: retry on its next mint
-            self.seen_mints.pop(token, None)
+            self.seen_mints.discard(token)
             return
         if not symbol or not self.scanner.is_watched(self.chain.key, symbol):
             return
-        if not await self._is_new_contract(token, lg.get("blockNumber")):
+        tx = lg.get("transactionHash")
+        is_new, name, label = await asyncio.gather(
+            self._is_new_contract(token, lg.get("blockNumber")),
+            self.token_name(token),
+            self._launchpad_label(tx, minted_to),
+        )
+        if not is_new:
             return
-        name = await self.token_name(token)
-        minted_to = abi.topic_address(topics[2])
-        label = await self._launchpad_label(lg.get("transactionHash"), minted_to)
         self.stats.detections += 1
         await self.scanner.on_detection(Detection(
             chain=self.chain.key, kind=LAUNCH, token_address=token, symbol=symbol, name=name,
-            pool_kind="launchpad", dex=label, source="onchain", tx_hash=lg.get("transactionHash"),
+            pool_kind="launchpad", dex=label, source="onchain", tx_hash=tx,
         ))
+
+    async def handle_first_liquidity(self, pair: str, lg: dict) -> None:
+        """First liquidity of a v2-style pair (any factory, created at any time)."""
+        token0, token1 = await asyncio.gather(self._address_call(pair, abi.SEL_TOKEN0),
+                                              self._address_call(pair, abi.SEL_TOKEN1))
+        if not token0 or not token1:
+            return
+        tx = lg.get("transactionHash")
+        for token, other in ((token0, token1), (token1, token0)):
+            if token in self.chain.quote_tokens or token == abi.ZERO_ADDRESS:
+                continue
+            symbol = await self.token_symbol(token)
+            if not symbol or not self.scanner.is_watched(self.chain.key, symbol):
+                continue
+            if self.scanner.db.find_results(self.chain.key, pair):  # pair already known: just liquidity
+                await self.scanner.on_detection(Detection(
+                    chain=self.chain.key, kind=LIQUIDITY, token_address=token, pair_address=pair,
+                    source="onchain", tx_hash=tx))
+                return
+            name, quote_symbol, factory, receipt = await asyncio.gather(
+                self.token_name(token), self.token_symbol(other),
+                self._address_call(pair, abi.SEL_FACTORY), self.receipt(tx))
+            created_now = any(
+                (x.get("topics") or [None])[0] == abi.V2_PAIR_CREATED and abi.word_address(x.get("data"), 0) == pair
+                for x in receipt.get("logs") or [])
+            dex = self.dex_by_address.get(factory or "", ("v2", f"DEX v2 · {short(factory or pair)}"))[1]
+            self.stats.detections += 1
+            await self.scanner.on_detection(Detection(
+                chain=self.chain.key, kind=PAIR, token_address=token, symbol=symbol, name=name,
+                pair_address=pair, pool_kind="v2", dex=dex, quote_symbol=quote_symbol or None,
+                quote_address=other, has_liquidity=True, pre_existing_pair=not created_now,
+                source="onchain", tx_hash=tx,
+            ))
+            return
 
     def _decode_pair(self, lg: dict) -> tuple[str, str, str, str, str, str | None] | None:
         """-> (pool_kind, dex, token0, token1, pool_address_or_id, hooks)"""
@@ -387,16 +523,15 @@ class EvmWatcher:
         if decoded is None:
             return
         kind, dex, token0, token1, pool, hooks = decoded
-        for token, other in ((token0, token1), (token1, token0)):
-            if token in self.chain.quote_tokens or token == abi.ZERO_ADDRESS:
-                continue
-            symbol = await self.token_symbol(token)
+        candidates = [(t, o) for t, o in ((token0, token1), (token1, token0))
+                      if t not in self.chain.quote_tokens and t != abi.ZERO_ADDRESS]
+        symbols = await asyncio.gather(*(self.token_symbol(t) for t, _ in candidates))
+        for (token, other), symbol in zip(candidates, symbols):
             if not symbol or not self.scanner.is_watched(self.chain.key, symbol):
                 continue
-            name = await self.token_name(token)
-            quote_symbol = await self.token_symbol(other)
             tx = lg.get("transactionHash")
-            has_liq = await self.liquidity_in_tx(tx, kind, pool)
+            name, quote_symbol, has_liq = await asyncio.gather(
+                self.token_name(token), self.token_symbol(other), self.liquidity_in_tx(tx, kind, pool))
             launchpad = self.chain.v4_hooks.get(hooks or "")
             self.stats.detections += 1
             await self.scanner.on_detection(Detection(
@@ -409,22 +544,17 @@ class EvmWatcher:
 
     async def liquidity_in_tx(self, tx_hash: str | None, kind: str, pool: str) -> bool:
         """Was liquidity added in the very transaction that created the pool?"""
-        if not tx_hash:
-            return False
-        try:
-            receipt = await self.rpc.call("eth_getTransactionReceipt", [tx_hash]) or {}
-        except RpcError:
-            return False
-        for lg in receipt.get("logs", []):
+        receipt = await self.receipt(tx_hash)
+        for lg in receipt.get("logs") or []:
             topics = lg.get("topics") or []
             if not topics:
                 continue
+            emitter = (lg.get("address") or "").lower()
             if kind == "v4":
                 if (topics[0] == abi.V4_MODIFY_LIQUIDITY and len(topics) > 1
                         and topics[1].lower() == pool and abi.word_int(lg.get("data"), 2) > 0):
                     return True
-            elif (topics[0] == abi.TRANSFER and len(topics) == 3
-                  and abi.topic_address(topics[2]) == pool and abi.word_uint(lg.get("data"), 0) > 0):
+            elif emitter == pool and topics[0] in (abi.V2_MINT, abi.V3_MINT):
                 return True
         return False
 
@@ -442,6 +572,14 @@ class EvmWatcher:
                 pair_address=pool_id, source="onchain", tx_hash=lg.get("transactionHash"),
             ))
 
+    async def _has_liquidity(self, res) -> bool:
+        if res.pool_kind in RESERVES_POOL_KINDS:
+            # Real two-sided reserves: tokens merely sent to the pair do not count.
+            data = await self._call(res.pair_address, abi.SEL_GET_RESERVES)
+            return abi.word_uint(data, 0) > 0 and abi.word_uint(data, 1) > 0
+        data = abi.encode_address_call(abi.SEL_BALANCE_OF, res.pair_address)
+        return _hex_int(await self._call(res.token_address, data)) > 0
+
     async def check_pending_liquidity(self, now: float | None = None) -> None:
         now = now or time.time()
         max_age = self.settings.pending_liquidity_max_age_h * 3600
@@ -457,27 +595,30 @@ class EvmWatcher:
         live_ids = {r.id for r in pending}
         for stale in [rid for rid in self._next_check if rid not in live_ids]:
             del self._next_check[stale]
-        seen: set[tuple[str, str]] = set()
+        due, seen = [], set()
         for res in pending:
-            if res.pool_kind not in BALANCE_POOL_KINDS or not res.pair_address:
+            if res.pool_kind not in RESERVES_POOL_KINDS + BALANCE_POOL_KINDS or not res.pair_address:
                 continue
             if self._next_check.get(res.id, 0) > now:
                 continue
             self._next_check[res.id] = now + pending_interval(now - res.found_at)
-            key = (res.token_address, res.pair_address)
-            if key in seen:
-                continue
-            seen.add(key)
-            data = abi.encode_address_call(abi.SEL_BALANCE_OF, res.pair_address)
+            if (res.token_address, res.pair_address) not in seen:
+                seen.add((res.token_address, res.pair_address))
+                due.append(res)
+
+        async def check(res) -> None:
             try:
-                balance = _hex_int(await self.rpc.call("eth_call", [{"to": res.token_address, "data": data}, "latest"]))
+                liquid = await self._has_liquidity(res)
             except RpcError:
-                continue
-            if balance > 0:
+                return
+            if liquid:
                 await self.scanner.on_detection(Detection(
                     chain=self.chain.key, kind=LIQUIDITY, token_address=res.token_address,
                     pair_address=res.pair_address, source="onchain",
                 ))
+
+        for i in range(0, len(due), 8):  # bounded parallelism
+            await asyncio.gather(*(check(r) for r in due[i:i + 8]))
 
     async def _liquidity_loop(self) -> None:
         while True:

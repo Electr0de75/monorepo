@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 
 from .chains import CHAINS
 from .config import Settings
+from .health import redact, register_secrets
 from .rpc import HttpRpc, RpcError
 from .telegram_api import TelegramAPI, TelegramError
 
@@ -72,6 +74,19 @@ async def check_rpcs(settings: Settings, client: httpx.AsyncClient) -> list[str]
     return warnings
 
 
+def check_env_permissions(path: str = ".env") -> str | None:
+    """Warn when the .env holding the bot token is readable by other users (POSIX)."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if os.name == "posix" and mode & 0o077:
+        msg = f"{path} est lisible par d'autres utilisateurs : lance « chmod 600 {path} »"
+        log.warning(msg)
+        return msg
+    return None
+
+
 def secrets_of(settings: Settings) -> list[str]:
     """Token and API keys found in the configuration (to mask them in logs)."""
     secrets = {settings.telegram_token}
@@ -88,18 +103,17 @@ def secrets_of(settings: Settings) -> list[str]:
 
 
 class RedactingFormatter(logging.Formatter):
-    def __init__(self, fmt: str, secrets: list[str]):
+    def __init__(self, fmt: str, secrets: list[str] | None = None):
         super().__init__(fmt)
-        self.secrets = secrets
+        if secrets is not None:
+            register_secrets(secrets)
 
     def format(self, record: logging.LogRecord) -> str:
-        text = super().format(record)
-        for secret in self.secrets:
-            text = text.replace(secret, "***")
-        return text
+        return redact(super().format(record))
 
 
 def install_redaction(secrets: list[str]) -> None:
+    register_secrets(secrets)
     for handler in logging.getLogger().handlers:
         fmt = handler.formatter._fmt if handler.formatter else "%(message)s"  # noqa: SLF001
         handler.setFormatter(RedactingFormatter(fmt, secrets))

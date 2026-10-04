@@ -13,7 +13,7 @@ from . import formatting as fmt
 from .chains import CHAINS, EVM_KEYS
 from .config import Settings
 from .db import Database
-from .models import MAX_TICKERS, Entry, Result, parse_tickers
+from .models import MAX_TICKERS, Entry, Result, clean_text, parse_tickers
 from .scanner import Scanner
 from .telegram_api import TelegramAPI, TelegramError
 
@@ -21,6 +21,9 @@ log = logging.getLogger(__name__)
 
 # Commands handled by the scanner; anything else is left to the host bot.
 COMMANDS = {"/start", "/scanner", "/nouveau", "/annuler", "/scanner_aide", "/scanner_etat"}
+REFRESH_COOLDOWN_S = 5
+MAX_WARNED_IDS = 1000
+OFFSET_KEY = "telegram_offset"
 CONFLICT_RETRIES = 3
 CONFLICT_RETRY_S = 35  # longer than a getUpdates long poll
 MAX_NAME_LEN = 40
@@ -92,6 +95,11 @@ class TelegramNotifier:
                       "au groupe, et vérifie TELEGRAM_NOTIFY_CHAT_ID.", self.chat_id, exc.description)
         raise exc
 
+    async def notice(self, entry: Entry, text: str) -> None:
+        markup = {"inline_keyboard": [[{"text": f"📋 Résultats · {entry.name}"[:60],
+                                        "callback_data": f"{fmt.CB}rn:{entry.id}"}]]}
+        await self._send(text, markup)
+
     async def edit(self, entry: Entry, result: Result, labels: list[str], note: str | None, message_id: int) -> None:
         await self.api.edit_message(
             self.chat_id, message_id, fmt.notification_text(entry, result, labels, note),
@@ -101,13 +109,15 @@ class TelegramNotifier:
 
 class BotUI:
     def __init__(self, api: TelegramAPI, db: Database, scanner: Scanner, settings: Settings,
-                 handle_start: bool = True):
+                 handle_start: bool = True, bot_username: str | None = None):
         self.api = api
         self.db = db
         self.scanner = scanner
         self.settings = settings
+        self.bot_username = (bot_username or "").lower() or None
         self.sessions: dict[int, Session] = {}
         self._warned_ids: set[int] = set()
+        self._last_refresh: dict[int, float] = {}
         # /start belongs to the host bot when the scanner is embedded in it.
         self.commands = set(COMMANDS) if handle_start else COMMANDS - {"/start"}
 
@@ -188,8 +198,16 @@ class BotUI:
         session.picker_message_id = await self._show(chat_id, message_id, text, markup)
 
     # ---- polling -------------------------------------------------------
+    def _stored_offset(self) -> int | None:
+        raw = self.db.get_meta(OFFSET_KEY)
+        try:
+            return int(raw) if raw is not None else None
+        except ValueError:
+            return None
+
     async def run_polling(self) -> None:
-        offset = None
+        # Resume after the last processed update: a restart must not replay clicks.
+        offset = self._stored_offset()
         conflicts = 0
         log.info("Menu Telegram actif (/scanner)")
         while True:
@@ -223,6 +241,7 @@ class BotUI:
                 if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
                     continue
                 offset = update["update_id"] + 1
+                self.db.set_meta(OFFSET_KEY, str(offset))
                 try:
                     await self.handle_update(update)
                 except Exception:  # noqa: BLE001
@@ -239,9 +258,9 @@ class BotUI:
 
     async def handle_update(self, update: dict) -> bool:
         """Process a raw Telegram update. Returns False when it is not for the scanner."""
-        if "callback_query" in update:
+        if isinstance(update.get("callback_query"), dict):
             return await self.on_callback(update["callback_query"])
-        if "message" in update:
+        if isinstance(update.get("message"), dict):
             return await self.on_message(update["message"])
         return False
 
@@ -252,11 +271,17 @@ class BotUI:
         text = (message.get("text") or "").strip()
         if user_id is None or chat_id is None or not text:
             return False
-        command = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
+        command = None
+        if text.startswith("/"):
+            head, _, target = text.split()[0].partition("@")
+            if target and self.bot_username and target.lower() != self.bot_username:
+                return False  # "/scanner@OtherBot" in a group is not for us
+            command = head.lower()
         if command is not None and command not in self.commands:
             return False
         if not self.allowed(user_id):
-            if command in ("/start", "/scanner") and not self.settings.allowed_users and user_id not in self._warned_ids:
+            if (command in ("/start", "/scanner") and not self.settings.allowed_users
+                    and user_id not in self._warned_ids and len(self._warned_ids) < MAX_WARNED_IDS):
                 self._warned_ids.add(user_id)
                 await self.api.send_message(
                     chat_id, f"Ton ID Telegram est <code>{user_id}</code>.\nAjoute-le dans "
@@ -293,7 +318,7 @@ class BotUI:
 
     async def on_input(self, chat_id: int, user_id: int, session: Session, text: str) -> None:
         if session.state in ("new_name", "edit_name"):
-            name = " ".join(text.split())
+            name = clean_text(text, MAX_NAME_LEN + 1)
             if not name or len(name) > MAX_NAME_LEN:
                 await self.api.send_message(chat_id, f"Le nom doit faire entre 1 et {MAX_NAME_LEN} caractères.")
                 return
@@ -334,11 +359,12 @@ class BotUI:
         chat_id = (message.get("chat") or {}).get("id")
         message_id = message.get("message_id")
         data = query.get("data") or ""
-        if not data.startswith(fmt.CB):
+        query_id = query.get("id")
+        if not isinstance(data, str) or not data.startswith(fmt.CB) or not isinstance(query_id, str):
             return False
         data = data[len(fmt.CB):]
         if user_id is None or not self.allowed(user_id):
-            await self.api.answer_callback(query["id"])
+            await self.api.answer_callback(query_id)
             return True
         if chat_id is None:
             chat_id = user_id
@@ -369,9 +395,13 @@ class BotUI:
         elif action == "p":
             entry = self.db.get_entry(arg_int(0))
             if entry is not None:
-                self.db.update_entry(entry.id, paused=not entry.paused)
-                self.scanner.reload()
-                toast = "▶️ Scan repris" if entry.paused else "⏸ Scan en pause"
+                # The button carries the target state, so a replayed click changes nothing.
+                target = arg_int(1, -1)
+                paused = (not entry.paused) if target not in (0, 1) else bool(target)
+                if paused != entry.paused:
+                    self.db.update_entry(entry.id, paused=paused)
+                    self.scanner.reload()
+                toast = "⏸ Scan en pause" if paused else "▶️ Scan repris"
             await self.show_entry(chat_id, arg_int(0), message_id)
         elif action == "ed":
             entry = self.db.get_entry(arg_int(0))
@@ -410,7 +440,12 @@ class BotUI:
         elif action == "rn":
             await self.show_results(chat_id, arg_int(0), 0)
         elif action == "rf":
-            await self.api.answer_callback(query["id"], "🔄 Mise à jour des market caps…")
+            now = time.monotonic()
+            if now - self._last_refresh.get(arg_int(0), -REFRESH_COOLDOWN_S) < REFRESH_COOLDOWN_S:
+                await self.api.answer_callback(query_id, "⏳ Patiente quelques secondes")
+                return True
+            self._last_refresh[arg_int(0)] = now
+            await self.api.answer_callback(query_id, "🔄 Mise à jour des market caps…")
             try:
                 await self.scanner.refresh_entry(arg_int(0))
             except Exception:  # noqa: BLE001
@@ -419,7 +454,7 @@ class BotUI:
             return True
         elif action in ("ct", "ca", "cv", "cx"):
             toast, alert = await self.on_picker(chat_id, user_id, message_id, action, args)
-        await self.api.answer_callback(query["id"], toast, alert)
+        await self.api.answer_callback(query_id, toast, alert)
         return True
 
     async def on_picker(self, chat_id: int, user_id: int, message_id: int | None, action: str,
@@ -427,6 +462,8 @@ class BotUI:
         session = self.sessions.get(user_id)
         if session is None or session.state != "pick_chains":
             return "Session expirée, recommence depuis /scanner", True
+        if message_id is not None and session.picker_message_id not in (None, message_id):
+            return "Ce sélecteur n'est plus actif, utilise le plus récent", True
         if action == "ct" and args and args[0] in CHAINS:
             session.selected ^= {args[0]}
         elif action == "ca":

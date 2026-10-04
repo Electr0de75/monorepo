@@ -46,6 +46,24 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS results_by_key ON results(chain, result_key);
 CREATE INDEX IF NOT EXISTS results_by_status ON results(status, found_at);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- Pairs that already existed when a ticker started being watched (DexScreener).
+CREATE TABLE IF NOT EXISTS baseline_meta (
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    ticker TEXT NOT NULL,
+    complete INTEGER NOT NULL,
+    taken_at REAL NOT NULL,
+    PRIMARY KEY (entry_id, ticker)
+);
+CREATE TABLE IF NOT EXISTS baseline (
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    chain TEXT NOT NULL,
+    result_key TEXT NOT NULL,
+    PRIMARY KEY (entry_id, chain, result_key)
+);
 """
 
 _RESULT_COLS = (
@@ -55,7 +73,7 @@ _RESULT_COLS = (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: meta + baseline tables (created by _SCHEMA)
 
 
 class Database:
@@ -125,6 +143,8 @@ class Database:
             # Do not flood the user with pairs that existed before the edit.
             sets.append("scan_since = ?")
             args.append(time.time())
+            self.conn.execute("DELETE FROM baseline WHERE entry_id = ?", (entry_id,))
+            self.conn.execute("DELETE FROM baseline_meta WHERE entry_id = ?", (entry_id,))
         if paused is not None:
             sets.append("paused = ?")
             args.append(1 if paused else 0)
@@ -136,6 +156,40 @@ class Database:
     def delete_entry(self, entry_id: int) -> None:
         self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
         self.conn.commit()
+
+    # ---- meta ----------------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT INTO meta(key, value) VALUES (?, ?) "
+                          "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+        self.conn.commit()
+
+    # ---- baseline (pairs pre-existing when a ticker started being watched)
+    def baseline_state(self, entry_id: int, ticker: str) -> bool | None:
+        """None: no snapshot yet; True/False: snapshot complete or truncated."""
+        row = self.conn.execute(
+            "SELECT complete FROM baseline_meta WHERE entry_id = ? AND ticker = ?", (entry_id, ticker)
+        ).fetchone()
+        return None if row is None else bool(row[0])
+
+    def save_baseline(self, entry_id: int, ticker: str, keys: Iterable[tuple[str, str]], complete: bool) -> None:
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO baseline(entry_id, chain, result_key) VALUES (?, ?, ?)",
+            [(entry_id, chain, key) for chain, key in keys],
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO baseline_meta(entry_id, ticker, complete, taken_at) VALUES (?, ?, ?, ?)",
+            (entry_id, ticker, 1 if complete else 0, time.time()),
+        )
+        self.conn.commit()
+
+    def in_baseline(self, entry_id: int, chain: str, key: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM baseline WHERE entry_id = ? AND chain = ? AND result_key = ?", (entry_id, chain, key)
+        ).fetchone() is not None
 
     # ---- results -------------------------------------------------------
     @staticmethod

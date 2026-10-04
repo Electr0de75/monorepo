@@ -1,4 +1,7 @@
-httpx>=0.27
-websockets>=13.0
-python-dotenv>=1.0
+httpx>=0.27,<1
+websockets>=13.0,<16
+python-dotenv>=1.0,<2
 tzdata; sys_platform == "win32"
+# Optional accelerators (not required):
+#   uvloop   faster event loop (Linux/macOS)
+#   orjson   faster JSON decoding of websocket streams

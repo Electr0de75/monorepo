@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -24,7 +25,9 @@ import httpx
 from .chains import PUMPFUN_CREATE_IXS, PUMPFUN_PROGRAM, SOLANA_LAUNCHPAD_PROGRAMS, SOLANA_QUOTE_MINTS
 from .health import SourceStats
 from .models import LAUNCH, Detection
-from .rpc import HttpRpc, RpcError, WsSubscriptions, cancel_requested, default_ws_connect, next_message
+from .rpc import (
+    HttpRpc, RpcError, WsSubscriptions, cancel_requested, default_ws_connect, json_loads, next_message,
+)
 
 if TYPE_CHECKING:
     from .scanner import Scanner
@@ -102,7 +105,9 @@ def logs_for_program(logs: list[str], program: str) -> ProgramLogs:
     """Instruction names and `Program data:` payloads emitted by `program`."""
     stack: list[str] = []
     out = ProgramLogs()
-    for line in logs or []:
+    for line in logs if isinstance(logs, list) else []:
+        if not isinstance(line, str):
+            continue
         m = _INVOKE.match(line)
         if m:
             stack.append(m.group(1))
@@ -125,15 +130,24 @@ def logs_for_program(logs: list[str], program: str) -> ProgramLogs:
     return out
 
 
+def _dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
 def created_accounts(tx: dict) -> set[str]:
     """Accounts that did not exist before this transaction (0 lamports before, > 0 after)."""
-    meta = tx.get("meta") or {}
-    pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
-    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+    meta = _dict(_dict(tx).get("meta"))
+    pre, post = _list(meta.get("preBalances")), _list(meta.get("postBalances"))
+    keys = _list(_dict(_dict(_dict(tx).get("transaction")).get("message")).get("accountKeys"))
     out = set()
     for i, key in enumerate(keys):
         pubkey = key.get("pubkey") if isinstance(key, dict) else key
-        if pubkey and i < len(pre) and i < len(post) and pre[i] == 0 and post[i] > 0:
+        if (isinstance(pubkey, str) and i < len(pre) and i < len(post)
+                and pre[i] == 0 and isinstance(post[i], (int, float)) and post[i] > 0):
             out.add(pubkey)
     return out
 
@@ -144,12 +158,12 @@ def new_mints(tx: dict) -> list[str]:
     The new token's mint account is created in the transaction, which tells it
     apart from the quote mint (SOL, USD1, or a stock token on StonkFun).
     """
-    meta = tx.get("meta") or {}
-    pre = {b.get("mint") for b in meta.get("preTokenBalances") or []}
+    meta = _dict(_dict(tx).get("meta"))
+    pre = {_dict(b).get("mint") for b in _list(meta.get("preTokenBalances"))}
     post: list[str] = []
-    for b in meta.get("postTokenBalances") or []:
-        mint = b.get("mint")
-        if mint and mint not in post and mint not in SOLANA_QUOTE_MINTS:
+    for b in _list(meta.get("postTokenBalances")):
+        mint = _dict(b).get("mint")
+        if isinstance(mint, str) and mint not in post and mint not in SOLANA_QUOTE_MINTS:
             post.append(mint)
     created = created_accounts(tx)
     fresh = [m for m in post if m not in pre]
@@ -158,16 +172,17 @@ def new_mints(tx: dict) -> list[str]:
 
 
 def instruction_blobs(tx: dict, program: str) -> list[bytes]:
-    msg = ((tx.get("transaction") or {}).get("message")) or {}
-    ixs = list(msg.get("instructions") or [])
-    for inner in (tx.get("meta") or {}).get("innerInstructions") or []:
-        ixs.extend(inner.get("instructions") or [])
+    msg = _dict(_dict(_dict(tx).get("transaction")).get("message"))
+    ixs = list(_list(msg.get("instructions")))
+    for inner in _list(_dict(_dict(tx).get("meta")).get("innerInstructions")):
+        ixs.extend(_list(_dict(inner).get("instructions")))
     blobs = []
     for ix in ixs:
+        ix = _dict(ix)
         if ix.get("programId") == program and isinstance(ix.get("data"), str):
             try:
                 blobs.append(b58decode(ix["data"]))
-            except KeyError:
+            except (KeyError, ValueError, OverflowError):
                 pass
     return blobs
 
@@ -176,6 +191,7 @@ def instruction_blobs(tx: dict, program: str) -> list[bytes]:
 class PumpPortalWatcher:
     # pump.fun creates tokens every few seconds: silence means a dead stream.
     STALL_TIMEOUT_S = 120
+    reconnect_delay = 1.0
 
     def __init__(self, scanner: "Scanner", connect=None, url: str = PUMPPORTAL_URL,
                  stats: SourceStats | None = None):
@@ -184,7 +200,6 @@ class PumpPortalWatcher:
         self.url = url
         self.stats = stats or SourceStats("solana:pumpportal")
         self.stats.mode = "websocket"
-        self.reconnect_delay = 1.0
         self.connections = 0
 
     async def run(self) -> None:
@@ -192,6 +207,7 @@ class PumpPortalWatcher:
         log.info("[solana] PumpPortal démarré")
         while True:
             started = time.monotonic()
+            received = 0
             try:
                 async with self.connect(self.url) as ws:
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
@@ -207,8 +223,9 @@ class PumpPortalWatcher:
                         except asyncio.TimeoutError:
                             raise ConnectionError(f"aucun message depuis {self.STALL_TIMEOUT_S}s") from None
                         self.stats.event()
+                        received += 1
                         try:
-                            msg = json.loads(raw)
+                            msg = json_loads(raw)
                         except ValueError:
                             continue
                         if not isinstance(msg, dict):
@@ -226,31 +243,34 @@ class PumpPortalWatcher:
                 log.warning("[solana] PumpPortal coupé (%s), reconnexion dans %.0fs", exc, backoff)
             finally:
                 self.stats.connected = False
-            if time.monotonic() - started > 60:
-                backoff = self.reconnect_delay
+            if received or time.monotonic() - started > 60:
+                backoff = self.reconnect_delay  # the stream was alive: reconnect right away
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
     async def handle(self, msg: dict) -> None:
         tx_type = msg.get("txType")
         mint = msg.get("mint")
-        if not mint:
+        if not isinstance(mint, str) or not mint:
             return
         if tx_type == "create":
-            symbol = msg.get("symbol") or ""
+            symbol = msg.get("symbol") if isinstance(msg.get("symbol"), str) else ""
             if not self.scanner.is_watched("solana", symbol):
                 return
             try:
                 mc_sol = float(msg.get("marketCapSol") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 mc_sol = 0.0
-            pool = msg.get("pool") or "pump"
+            if not math.isfinite(mc_sol) or mc_sol < 0:
+                mc_sol = 0.0
+            pool = msg.get("pool") if isinstance(msg.get("pool"), str) else "pump"
             self.stats.detections += 1
             await self.scanner.on_detection(Detection(
                 chain="solana", kind=LAUNCH, token_address=mint, symbol=symbol,
-                name=msg.get("name") or "", pair_address=msg.get("bondingCurveKey"),
+                name=msg.get("name") if isinstance(msg.get("name"), str) else "",
+                pair_address=msg.get("bondingCurveKey") if isinstance(msg.get("bondingCurveKey"), str) else None,
                 pool_kind="launchpad", dex=PUMPPORTAL_POOLS.get(pool, pool), source="pumpportal",
-                tx_hash=msg.get("signature"),
+                tx_hash=msg.get("signature") if isinstance(msg.get("signature"), str) else None,
                 market_cap_note=f"{mc_sol:.1f} SOL" if mc_sol else None,
             ))
         elif tx_type in ("migrate", "migration"):

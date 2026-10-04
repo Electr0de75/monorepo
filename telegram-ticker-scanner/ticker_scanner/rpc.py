@@ -14,6 +14,11 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+try:  # optional: ~3x faster JSON decoding of the websocket firehose (pip install orjson)
+    from orjson import loads as json_loads  # type: ignore
+except ImportError:  # pragma: no cover
+    json_loads = json.loads
+
 # Error kinds
 NETWORK = "network"        # transport error, HTTP 5xx: retry later
 RATE_LIMIT = "rate_limit"  # HTTP 429 or provider quota message: retry later
@@ -145,6 +150,8 @@ class WsSubscriptions:
     closing the socket).
     """
 
+    reconnect_delay = 1.0
+
     def __init__(self, url: str, *, subscribe_method: str, unsubscribe_method: str,
                  on_message: OnMessage, on_connect: Callable[[], Awaitable[None]] | None = None,
                  connect: Callable[[str], Any] | None = None, name: str = "ws",
@@ -165,7 +172,7 @@ class WsSubscriptions:
         self._side_tasks: set[asyncio.Task] = set()
         self.connected = False
         self.connections = 0
-        self.reconnect_delay = 1.0
+        self._session_messages = 0
 
     def set(self, name: str, params: list | None) -> None:
         if self.specs.get(name) != params:
@@ -181,6 +188,7 @@ class WsSubscriptions:
         backoff = self.reconnect_delay
         while True:
             started = time.monotonic()
+            self._session_messages = 0
             try:
                 async with self.connect(self.url) as ws:
                     self.connections += 1
@@ -199,8 +207,8 @@ class WsSubscriptions:
                     if not fut.done():
                         fut.set_exception(ConnectionError("websocket closed"))
                 self._pending.clear()
-            if time.monotonic() - started > 60:
-                backoff = self.reconnect_delay  # the connection was healthy for a while
+            if self._session_messages or time.monotonic() - started > 60:
+                backoff = self.reconnect_delay  # the connection was useful: reconnect right away
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -233,7 +241,7 @@ class WsSubscriptions:
             except asyncio.TimeoutError:
                 raise ConnectionError(f"aucun message depuis {self.stall_timeout:.0f}s") from None
             try:
-                msg = json.loads(raw)
+                msg = json_loads(raw)
             except ValueError:
                 continue
             if not isinstance(msg, dict):
@@ -250,6 +258,7 @@ class WsSubscriptions:
             name = routes.get(params.get("subscription")) if isinstance(params, dict) else None
             if name is None:
                 continue
+            self._session_messages += 1
             try:
                 res = self.on_message(name, params.get("result"))
                 if asyncio.iscoroutine(res):

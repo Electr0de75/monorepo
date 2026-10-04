@@ -8,6 +8,19 @@ from dataclasses import dataclass, field
 # A real-time source that received nothing for this long is flagged as stale.
 STALE_AFTER_S = 180
 
+# Secrets (bot token, API keys) masked in anything shown to the user.
+_SECRETS: list[str] = []
+
+
+def register_secrets(secrets: list[str]) -> None:
+    _SECRETS[:] = sorted({s for s in secrets if s and len(s) >= 8}, key=len, reverse=True)
+
+
+def redact(text: str) -> str:
+    for secret in _SECRETS:
+        text = text.replace(secret, "***")
+    return text
+
 
 @dataclass
 class SourceStats:
@@ -28,7 +41,7 @@ class SourceStats:
 
     def error(self, message: str) -> None:
         self.errors += 1
-        self.last_error = message[:200]
+        self.last_error = redact(str(message))[:200]
         self.last_error_at = time.time()
 
     def state(self, now: float | None = None) -> str:
