@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from .chains import CHAINS
+
+log = logging.getLogger(__name__)
 
 try:  # optional dependency
     from dotenv import load_dotenv
@@ -48,13 +52,38 @@ class Settings:
         return min(self.allowed_users) if self.allowed_users else None
 
 
-def _int_set(raw: str) -> set[int]:
+def _int_set(raw: str, key: str) -> set[int]:
     out = set()
-    for part in raw.replace(";", ",").split(","):
+    for part in raw.replace(";", ",").replace(" ", ",").split(","):
         part = part.strip()
         if part:
-            out.add(int(part))
+            try:
+                out.add(int(part))
+            except ValueError:
+                raise SystemExit(f"{key} invalide : « {part} » n'est pas un ID Telegram numérique") from None
     return out
+
+
+def _number(env: dict[str, str], key: str, default: float, cast=float, minimum: float = 0):
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return cast(default)
+    try:
+        value = cast(raw)
+    except ValueError:
+        raise SystemExit(f"{key} invalide : « {raw} » (nombre attendu)") from None
+    if value < minimum:
+        raise SystemExit(f"{key} invalide : {value} (minimum {minimum})")
+    return value
+
+
+def _url(env: dict[str, str], key: str, schemes: tuple[str, ...]) -> str | None:
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return None
+    if not raw.startswith(schemes):
+        raise SystemExit(f"{key} invalide : doit commencer par {' ou '.join(schemes)}")
+    return raw
 
 
 def _bool(raw: str | None, default: bool) -> bool:
@@ -83,33 +112,46 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN manquant (voir .env.example)")
 
-    notify = env.get("TELEGRAM_NOTIFY_CHAT_ID", "").strip()
+    if ":" not in token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN invalide (format attendu 123456:ABC…, donné par @BotFather)")
+
+    notify_raw = env.get("TELEGRAM_NOTIFY_CHAT_ID", "").strip()
+    try:
+        notify = int(notify_raw) if notify_raw else None
+    except ValueError:
+        raise SystemExit(f"TELEGRAM_NOTIFY_CHAT_ID invalide : « {notify_raw} » (ID numérique attendu)") from None
 
     evm_rpc: dict[str, EvmRpc] = {}
     for chain in CHAINS.values():
         if not chain.is_evm or not chain.env_prefix:
             continue
-        ws = env.get(f"{chain.env_prefix}_WS_URL", "").strip() or None
-        http = env.get(f"{chain.env_prefix}_HTTP_URL", "").strip() or _derive_http(ws)
+        ws = _url(env, f"{chain.env_prefix}_WS_URL", ("wss://", "ws://"))
+        http = _url(env, f"{chain.env_prefix}_HTTP_URL", ("https://", "http://")) or _derive_http(ws)
         if ws or http:
             evm_rpc[chain.key] = EvmRpc(ws_url=ws, http_url=http)
 
-    solana_ws = env.get("SOLANA_WS_URL", "").strip() or None
-    solana_http = env.get("SOLANA_HTTP_URL", "").strip() or _derive_http(solana_ws)
+    solana_ws = _url(env, "SOLANA_WS_URL", ("wss://", "ws://"))
+    solana_http = _url(env, "SOLANA_HTTP_URL", ("https://", "http://")) or _derive_http(solana_ws)
+
+    timezone = env.get("TIMEZONE", "Europe/Paris").strip() or "Europe/Paris"
+    try:
+        ZoneInfo(timezone)
+    except Exception:  # noqa: BLE001 - unknown zone or no tz database (Windows without tzdata)
+        log.warning("TIMEZONE « %s » inconnue, heure locale utilisée", timezone)
 
     return Settings(
         telegram_token=token,
-        allowed_users=_int_set(env.get("TELEGRAM_ALLOWED_USERS", "")),
-        notify_chat_id=int(notify) if notify else None,
-        timezone=env.get("TIMEZONE", "Europe/Paris").strip() or "Europe/Paris",
+        allowed_users=_int_set(env.get("TELEGRAM_ALLOWED_USERS", ""), "TELEGRAM_ALLOWED_USERS"),
+        notify_chat_id=notify,
+        timezone=timezone,
         db_path=env.get("DB_PATH", "ticker_scanner.db").strip() or "ticker_scanner.db",
         evm_rpc=evm_rpc,
-        evm_getlogs_max_range=int(env.get("EVM_GETLOGS_MAX_RANGE", "10") or 10),
-        evm_poll_interval=float(env.get("EVM_POLL_INTERVAL", "2") or 2),
-        evm_liquidity_check_interval=float(env.get("EVM_LIQUIDITY_CHECK_INTERVAL", "6") or 6),
+        evm_getlogs_max_range=_number(env, "EVM_GETLOGS_MAX_RANGE", 10, int, 1),
+        evm_poll_interval=_number(env, "EVM_POLL_INTERVAL", 2, float, 0.2),
+        evm_liquidity_check_interval=_number(env, "EVM_LIQUIDITY_CHECK_INTERVAL", 6, float, 1),
         pumpportal_enabled=_bool(env.get("PUMPPORTAL_ENABLED"), True),
         solana_ws_url=solana_ws,
         solana_http_url=solana_http,
-        dexscreener_interval=float(env.get("DEXSCREENER_INTERVAL", "15") or 15),
-        pending_liquidity_max_age_h=float(env.get("PENDING_LIQUIDITY_MAX_AGE_H", "72") or 72),
+        dexscreener_interval=_number(env, "DEXSCREENER_INTERVAL", 15, float, 2),
+        pending_liquidity_max_age_h=_number(env, "PENDING_LIQUIDITY_MAX_AGE_H", 72, float, 1),
     )

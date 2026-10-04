@@ -18,12 +18,16 @@ import httpx
 from .chains import CHAINS, norm_address
 from .config import Settings
 from .db import Database
-from .dexscreener import DexScreener, best_pair, is_known_dex, metrics, pair_to_detection
+from .dexscreener import (
+    DexScreener, base_address, base_symbol, best_pair, is_known_dex, metrics, pair_to_detection,
+)
 from .evm_watcher import EvmWatcher
+from .health import SourceStats
 from .models import (
     LABEL_LAUNCH, LABEL_LIQ, LABEL_PAIR, LAUNCH, LIQUIDITY, PAIR, STATUS_LAUNCH, STATUS_LIQ, STATUS_PAIR,
-    Detection, Entry, Result, normalize_ticker,
+    Detection, Entry, Result, clean_text, normalize_ticker,
 )
+from .rpc import cancel_requested, wait_result
 from .solana import PumpPortalWatcher, SolanaLaunchpadWatcher
 
 log = logging.getLogger(__name__)
@@ -36,6 +40,14 @@ ENRICH_INTERVAL_S = 120
 ENRICH_MAX_AGE_S = 24 * 3600
 FOLLOWUP_DELAYS_S = (20, 60, 180)
 NEW_PAIR_LOOKUP_DELAYS_S = (3, 10, 30, 90)
+NOTIFY_RETRY_DELAYS_S = (2, 5, 15, 30, 60)
+SUPERVISOR_FIRST_DELAY_S = 1.0
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Network errors and Telegram 429/5xx are worth retrying; 400/401/403/404 are not."""
+    code = getattr(exc, "code", None)
+    return code is None or code == 429 or (isinstance(code, int) and code >= 500)
 
 
 class Notifier(Protocol):
@@ -64,7 +76,20 @@ class Scanner:
         self._last_notif: dict[int, tuple[int, list[str], str | None]] = {}
         self._background: set[asyncio.Task] = set()
         self._sync_now = asyncio.Event()
+        self.stats: dict[str, SourceStats] = {}
+        self.dexscreener_stats = self.source_stats("dexscreener")
+        self.dexscreener_stats.mode = "API"
+        self.dexscreener_stats.connected = True
+        self.notifications_sent = 0
+        self.notifications_failed = 0
+        self.started_at = time.time()
+        self.config_warnings: list[str] = []
         self.reload()
+
+    def source_stats(self, name: str) -> SourceStats:
+        if name not in self.stats:
+            self.stats[name] = SourceStats(name)
+        return self.stats[name]
 
     # ---- watch index ---------------------------------------------------
     def reload(self) -> None:
@@ -100,6 +125,11 @@ class Scanner:
         det.token_address = norm_address(det.chain, det.token_address)
         det.pair_address = norm_address(det.chain, det.pair_address)
         det.quote_address = norm_address(det.chain, det.quote_address)
+        # Token names/symbols come from anyone deploying a contract: keep them tame.
+        det.symbol = clean_text(det.symbol, 24)
+        det.name = clean_text(det.name, 48)
+        det.dex = clean_text(det.dex, 60)
+        det.quote_symbol = clean_text(det.quote_symbol, 24) or None
         async with self._lock:
             if det.kind == LIQUIDITY:
                 self._on_liquidity(det)
@@ -146,16 +176,29 @@ class Scanner:
             entry, result, labels, note = await self._notify_queue.get()
             if self.notifier is None:
                 continue
-            try:
-                message_id = await self.notifier.send(entry, result, labels, note)
-            except Exception:  # noqa: BLE001
-                log.exception("envoi de notification")
-                continue
+            message_id = await self._send_with_retry(entry, result, labels, note)
             if message_id:
                 self.db.set_notify_message(result.id, message_id)
-                self._last_notif[result.id] = (message_id, labels, note)
-            if result.has_liquidity and result.market_cap is None:
-                self._spawn(self._followup(result.id))
+                if result.has_liquidity and result.market_cap is None:
+                    self._last_notif[result.id] = (message_id, labels, note)
+                    self._spawn(self._followup(result.id))
+
+    async def _send_with_retry(self, entry: Entry, result: Result, labels: list[str],
+                               note: str | None) -> int | None:
+        for attempt in range(len(NOTIFY_RETRY_DELAYS_S) + 1):
+            try:
+                message_id = await self.notifier.send(entry, result, labels, note)
+                self.notifications_sent += 1
+                return message_id
+            except Exception as exc:  # noqa: BLE001
+                if attempt >= len(NOTIFY_RETRY_DELAYS_S) or not is_retryable(exc):
+                    self.notifications_failed += 1
+                    log.error("notification perdue (%s %s): %r", result.symbol, labels, exc)
+                    return None
+                delay = NOTIFY_RETRY_DELAYS_S[attempt]
+                log.warning("envoi de notification échoué (%r), nouvel essai dans %ss", exc, delay)
+                await asyncio.sleep(delay)
+        return None
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.create_task(coro)
@@ -164,26 +207,29 @@ class Scanner:
 
     async def _followup(self, result_id: int) -> None:
         """Fill liquidity / market cap from DexScreener and update the notification."""
-        for delay in FOLLOWUP_DELAYS_S:
-            await asyncio.sleep(delay)
-            res = self.db.get_result_by_id(result_id)
-            if res is None:
+        try:
+            for delay in FOLLOWUP_DELAYS_S:
+                await asyncio.sleep(delay)
+                res = self.db.get_result_by_id(result_id)
+                if res is None:
+                    return
+                pair = await self._lookup_pair(res)
+                if pair is None:
+                    continue
+                liq, mc = metrics(pair)
+                if liq is None and mc is None:
+                    continue
+                self.db.update_metrics(res.id, liq, mc)
+                last = self._last_notif.get(res.id)
+                entry = self.db.get_entry(res.entry_id)
+                if last and entry and self.notifier is not None:
+                    try:
+                        await self.notifier.edit(entry, self.db.get_result_by_id(res.id), last[1], last[2], last[0])
+                    except Exception:  # noqa: BLE001
+                        log.debug("édition de notification impossible", exc_info=True)
                 return
-            pair = await self._lookup_pair(res)
-            if pair is None:
-                continue
-            liq, mc = metrics(pair)
-            if liq is None and mc is None:
-                continue
-            self.db.update_metrics(res.id, liq, mc)
-            last = self._last_notif.get(res.id)
-            entry = self.db.get_entry(res.entry_id)
-            if last and entry and self.notifier is not None:
-                try:
-                    await self.notifier.edit(entry, self.db.get_result_by_id(res.id), last[1], last[2], last[0])
-                except Exception:  # noqa: BLE001
-                    log.debug("édition de notification impossible", exc_info=True)
-            return
+        finally:
+            self._last_notif.pop(result_id, None)
 
     async def _lookup_pair(self, res: Result) -> dict | None:
         chain = CHAINS.get(res.chain)
@@ -191,7 +237,7 @@ class Scanner:
             return None
         pairs = await self.ds.tokens(chain.dexscreener, [res.token_address])
         pairs = [p for p in pairs
-                 if norm_address(res.chain, (p.get("baseToken") or {}).get("address")) == res.token_address]
+                 if norm_address(res.chain, base_address(p)) == res.token_address]
         return best_pair(pairs, res.pair_address, res.chain)
 
     def lookup_new_pairs_soon(self, chain: str, token: str) -> None:
@@ -205,7 +251,7 @@ class Scanner:
             await asyncio.sleep(delay)
             found = False
             for p in await self.ds.tokens(chain.dexscreener, [token]):
-                if norm_address(chain_key, (p.get("baseToken") or {}).get("address")) != token:
+                if norm_address(chain_key, base_address(p)) != token:
                     continue
                 if not is_known_dex(p):
                     continue
@@ -219,8 +265,7 @@ class Scanner:
 
     # ---- DexScreener ---------------------------------------------------
     async def handle_dexscreener_pair(self, pair: dict, ticker: str, chains: set[str]) -> None:
-        base = pair.get("baseToken") or {}
-        if normalize_ticker(base.get("symbol")) != ticker:
+        if normalize_ticker(base_symbol(pair)) != ticker:
             return
         det = pair_to_detection(pair)
         if det is None or det.chain not in chains:
@@ -235,9 +280,14 @@ class Scanner:
             for ticker, chains in self.ticker_index().items():
                 try:
                     pairs = await self.ds.search(ticker)
+                    if pairs is None:
+                        self.dexscreener_stats.error(f"recherche {ticker} sans réponse")
+                        continue
+                    self.dexscreener_stats.event()
                     for pair in pairs:
                         await self.handle_dexscreener_pair(pair, ticker, chains)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    self.dexscreener_stats.error(str(exc))
                     log.exception("dexscreener: recherche %s", ticker)
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(1.0, self.settings.dexscreener_interval - elapsed))
@@ -257,7 +307,7 @@ class Scanner:
                 if liq and liq > 0:
                     await self.on_detection(Detection(
                         chain=chain_key, kind=LIQUIDITY,
-                        token_address=(pair.get("baseToken") or {}).get("address") or "",
+                        token_address=base_address(pair) or "",
                         pair_address=pair.get("pairAddress"), liquidity_usd=liq, market_cap=mc,
                         source="dexscreener",
                     ))
@@ -275,7 +325,7 @@ class Scanner:
             pairs = await self.ds.tokens(chain.dexscreener, tokens)
             by_token: dict[str, list[dict]] = {}
             for p in pairs:
-                addr = norm_address(chain_key, (p.get("baseToken") or {}).get("address"))
+                addr = norm_address(chain_key, base_address(p))
                 by_token.setdefault(addr, []).append(p)
             for res in items:
                 candidates = by_token.get(res.token_address, [])
@@ -321,17 +371,29 @@ class Scanner:
                 continue
             desired[f"evm:{key}"] = (
                 lambda chain=chain, rpc=rpc: EvmWatcher(
-                    chain, rpc, self, self.settings, self.http, ws_connect=self.ws_connect).run()
+                    chain, rpc, self, self.settings, self.http, ws_connect=self.ws_connect,
+                    stats=self._fresh_stats(f"evm:{chain.key}")).run()
             )
         if "solana" in chains:
             if self.settings.pumpportal_enabled:
-                desired["solana:pumpportal"] = lambda: PumpPortalWatcher(self, connect=self.ws_connect).run()
+                desired["solana:pumpportal"] = lambda: PumpPortalWatcher(
+                    self, connect=self.ws_connect, stats=self._fresh_stats("solana:pumpportal")).run()
             if self.settings.solana_ws_url and self.settings.solana_http_url:
                 desired["solana:launchpads"] = lambda: SolanaLaunchpadWatcher(
                     self.settings.solana_ws_url, self.settings.solana_http_url, self, self.http,
                     include_pumpfun=not self.settings.pumpportal_enabled, connect=self.ws_connect,
+                    stats=self._fresh_stats("solana:launchpads"),
                 ).run()
         return desired
+
+    def _fresh_stats(self, name: str) -> SourceStats:
+        self.stats[name] = SourceStats(name)
+        return self.stats[name]
+
+    def live_stats(self) -> list[SourceStats]:
+        """Stats of the running sources (+ DexScreener), for the status page."""
+        running = set(self.source_names())
+        return [st for name, st in sorted(self.stats.items()) if name in running or name == "dexscreener"]
 
     def sync_sources(self) -> None:
         desired = self._desired_sources()
@@ -350,19 +412,36 @@ class Scanner:
             self.sync_sources()
             self._sync_now.clear()
             try:
-                await asyncio.wait_for(self._sync_now.wait(), timeout=SYNC_INTERVAL_S)
+                await wait_result(self._sync_now.wait(), SYNC_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass
 
+    async def _supervise(self, name: str, factory: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+        """Run a background loop forever, restarting it if it ever crashes."""
+        delay = SUPERVISOR_FIRST_DELAY_S
+        while True:
+            try:
+                await factory()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if cancel_requested():
+                    raise asyncio.CancelledError from exc
+                log.exception("boucle %s plantée, redémarrage dans %.0fs", name, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
     async def run(self) -> None:
-        loops = [
-            self._notify_worker(),
-            self._sources_loop(),
-            self._dexscreener_loop(),
-            self._every(DS_LIQUIDITY_INTERVAL_S, self.check_pending_on_dexscreener, "dexscreener: liquidité"),
-            self._every(ENRICH_INTERVAL_S, self._enrich, "dexscreener: market caps"),
-        ]
-        tasks = [asyncio.create_task(c) for c in loops]
+        loops = {
+            "notifications": self._notify_worker,
+            "sources": self._sources_loop,
+            "dexscreener": self._dexscreener_loop,
+            "liquidité": lambda: self._every(DS_LIQUIDITY_INTERVAL_S, self.check_pending_on_dexscreener,
+                                             "dexscreener: liquidité"),
+            "market caps": lambda: self._every(ENRICH_INTERVAL_S, self._enrich, "dexscreener: market caps"),
+        }
+        tasks = [asyncio.create_task(self._supervise(name, fn), name=name) for name, fn in loops.items()]
         try:
             await asyncio.gather(*tasks)
         finally:

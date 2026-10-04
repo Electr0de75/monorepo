@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 
 import httpx
@@ -71,11 +72,15 @@ class EvmWatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(WBNB, [p[0]["to"] for m, p in self.node.calls if m == "eth_call"])
 
         # liquidity check: balance of the pool becomes > 0
-        await self.watcher.check_pending_liquidity()
+        now = time.time()
+        await self.watcher.check_pending_liquidity(now)
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 1)
         self.node.balances[(TOKEN, PAIR)] = 10 ** 18
-        await self.watcher.check_pending_liquidity()
+        await self.watcher.check_pending_liquidity(now + 1)  # too soon: not checked again
+        await drain(self.scanner)
+        self.assertEqual(len(self.notifier.sent), 1)
+        await self.watcher.check_pending_liquidity(now + 7)
         await drain(self.scanner)
         self.assertEqual(len(self.notifier.sent), 2)
         self.assertEqual(self.notifier.sent[1][2], ["liq"])
@@ -158,7 +163,7 @@ class EvmWatcherTest(unittest.IsolatedAsyncioTestCase):
         self.watcher.last_block = 0x100
         self.node.block = 0x105
         await self.watcher._fetch_range(0x101, 0x105)
-        name, lg = self.watcher.queue.get_nowait()
+        _, _, name, lg = self.watcher.queue.get_nowait()
         self.assertEqual(name, "pairs")
         await self.watcher.handle_pair(lg)
         await drain(self.scanner)

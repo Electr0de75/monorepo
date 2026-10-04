@@ -19,6 +19,23 @@ STATUS_LIQ = "liq"     # liquidity added
 MAX_TICKERS = 3
 
 
+# Bidi overrides / isolates can visually reorder a message (spoofing).
+_BIDI = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A), 0x200E, 0x200F, 0x061C)}
+
+
+def clean_text(raw: str | None, max_len: int) -> str:
+    """Strip control and bidi characters, collapse whitespace, truncate."""
+    if not raw:
+        return ""
+    chars = []
+    for ch in str(raw):
+        if ch in _BIDI:
+            continue
+        chars.append(" " if unicodedata.category(ch) == "Cc" else ch)
+    text = " ".join("".join(chars).split())
+    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+
 def normalize_ticker(raw: str | None) -> str:
     if not raw:
         return ""

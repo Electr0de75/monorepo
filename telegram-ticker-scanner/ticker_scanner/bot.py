@@ -20,7 +20,9 @@ from .telegram_api import TelegramAPI, TelegramError
 log = logging.getLogger(__name__)
 
 # Commands handled by the scanner; anything else is left to the host bot.
-COMMANDS = {"/start", "/scanner", "/nouveau", "/annuler", "/scanner_aide"}
+COMMANDS = {"/start", "/scanner", "/nouveau", "/annuler", "/scanner_aide", "/scanner_etat"}
+CONFLICT_RETRIES = 3
+CONFLICT_RETRY_S = 35  # longer than a getUpdates long poll
 MAX_NAME_LEN = 40
 MAX_TICKER_LEN = 20
 
@@ -55,16 +57,40 @@ class TelegramNotifier:
         self._lock = asyncio.Lock()
 
     async def send(self, entry: Entry, result: Result, labels: list[str], note: str | None) -> int | None:
+        return await self._send(fmt.notification_text(entry, result, labels, note),
+                                fmt.notification_keyboard(entry, result))
+
+    async def send_test(self) -> int | None:
+        entry, result = fmt.sample_notification()
+        return await self._send(fmt.notification_text(entry, result, ["pair", "liq"], None, test=True),
+                                {"inline_keyboard": fmt.links_keyboard(result)})
+
+    async def _send(self, text: str, markup: dict) -> int | None:
         async with self._lock:
             wait = self._last + self.min_interval - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
-            msg = await self.api.send_message(
-                self.chat_id, fmt.notification_text(entry, result, labels, note),
-                fmt.notification_keyboard(entry, result),
-            )
-            self._last = time.monotonic()
+            try:
+                msg = await self.api.send_message(self.chat_id, text, markup)
+            except TelegramError as exc:
+                msg = await self._fallback(exc, text, markup)
+            finally:
+                self._last = time.monotonic()
         return (msg or {}).get("message_id")
+
+    async def _fallback(self, exc: TelegramError, text: str, markup: dict) -> dict:
+        desc = exc.description.lower()
+        if exc.code == 400 and "parse" in desc:
+            # Never lose a notification over formatting: resend as plain text.
+            return await self.api.send_message(self.chat_id, fmt.html_to_text(text), markup, parse_mode=None)
+        if exc.code == 400 and ("button" in desc or "url" in desc):
+            rows = [[b for b in row if "url" not in b] for row in markup.get("inline_keyboard", [])]
+            rows = [r for r in rows if r]
+            return await self.api.send_message(self.chat_id, text, {"inline_keyboard": rows} if rows else None)
+        if exc.code in (400, 403):
+            log.error("Telegram refuse d'écrire dans le chat %s (%s). Envoie /start au bot ou ajoute-le "
+                      "au groupe, et vérifie TELEGRAM_NOTIFY_CHAT_ID.", self.chat_id, exc.description)
+        raise exc
 
     async def edit(self, entry: Entry, result: Result, labels: list[str], note: str | None, message_id: int) -> None:
         await self.api.edit_message(
@@ -109,10 +135,10 @@ class BotUI:
         msg = await self.api.send_message(chat_id, text, markup)
         return (msg or {}).get("message_id")
 
-    async def show_main(self, chat_id: int, message_id: int | None = None) -> None:
+    async def show_main(self, chat_id: int, message_id: int | None = None, page: int = 0) -> None:
         entries = self.db.list_entries()
         counts = {e.id: self.db.count_results(e.id) for e in entries}
-        text, markup = fmt.main_menu(entries, counts, self.scanner.source_names())
+        text, markup = fmt.main_menu(entries, counts, self.scanner.source_names(), page)
         await self._show(chat_id, message_id, text, markup)
 
     async def show_entry(self, chat_id: int, entry_id: int, message_id: int | None = None,
@@ -137,6 +163,25 @@ class BotUI:
         )
         await self._show(chat_id, message_id, text, markup)
 
+    async def show_status(self, chat_id: int, message_id: int | None = None) -> None:
+        text, markup = fmt.status_page(
+            self.scanner.live_stats(), started_at=self.scanner.started_at,
+            sent=self.scanner.notifications_sent, failed=self.scanner.notifications_failed,
+            notify_chat=self.settings.target_chat_id, warnings=self.scanner.config_warnings,
+            has_entries=bool(self.scanner.desired_chains()),
+        )
+        await self._show(chat_id, message_id, text, markup)
+
+    async def send_test_notification(self) -> tuple[str, bool]:
+        notifier = self.scanner.notifier
+        if not isinstance(notifier, TelegramNotifier):
+            return "Aucun chat de notification configuré (TELEGRAM_NOTIFY_CHAT_ID)", True
+        try:
+            await notifier.send_test()
+        except (TelegramError, httpx.HTTPError) as exc:
+            return f"Échec de l'envoi : {exc}"[:190], True
+        return "🔔 Notif de test envoyée", False
+
     async def show_picker(self, chat_id: int, session: Session, message_id: int | None = None) -> None:
         title = f"Blockchains pour « {session.name} »"
         text, markup = fmt.chain_picker(title, session.selected, self.realtime())
@@ -145,15 +190,25 @@ class BotUI:
     # ---- polling -------------------------------------------------------
     async def run_polling(self) -> None:
         offset = None
+        conflicts = 0
         log.info("Menu Telegram actif (/scanner)")
         while True:
             try:
                 updates = await self.api.get_updates(offset)
+                conflicts = 0
             except TelegramError as exc:
                 if exc.code == 409:
-                    log.error("Conflit getUpdates: %s", exc.description)
-                    await self._notify_conflict()
-                    return
+                    # A previous instance still finishing its long poll (restart) clears
+                    # within 30 s; a webhook or a second bot reading updates does not.
+                    if "webhook" in exc.description.lower() or conflicts >= CONFLICT_RETRIES:
+                        log.error("Conflit getUpdates: %s", exc.description)
+                        await self._notify_conflict()
+                        return
+                    conflicts += 1
+                    log.warning("Conflit getUpdates (%d/%d), nouvel essai dans %ss",
+                                conflicts, CONFLICT_RETRIES, CONFLICT_RETRY_S)
+                    await asyncio.sleep(CONFLICT_RETRY_S)
+                    continue
                 if exc.code == 401:
                     log.error("TELEGRAM_BOT_TOKEN invalide")
                     return
@@ -161,10 +216,12 @@ class BotUI:
                 await asyncio.sleep(3)
                 continue
             except httpx.HTTPError as exc:
-                log.warning("getUpdates réseau: %s", exc)
+                log.warning("getUpdates réseau: %s", type(exc).__name__)
                 await asyncio.sleep(3)
                 continue
-            for update in updates or []:
+            for update in updates if isinstance(updates, list) else []:
+                if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+                    continue
                 offset = update["update_id"] + 1
                 try:
                     await self.handle_update(update)
@@ -226,6 +283,8 @@ class BotUI:
             await self.show_main(chat_id)
         elif command == "/scanner_aide":
             await self.api.send_message(chat_id, fmt.HELP)
+        elif command == "/scanner_etat":
+            await self.show_status(chat_id)
 
     async def start_creation(self, chat_id: int, user_id: int) -> None:
         self.sessions[user_id] = Session(state="new_name")
@@ -249,6 +308,9 @@ class BotUI:
             await self.api.send_message(
                 chat_id, f"Projet <b>{fmt.esc(name)}</b>.\nEnvoie <b>1 à {MAX_TICKERS} tickers</b> "
                          "séparés par un espace ou une virgule (ex : <code>$ABC, ABCD</code>).")
+        elif session.state == "pick_chains":
+            await self.api.send_message(chat_id, "Choisis les blockchains avec les boutons ci-dessus, puis "
+                                                 "<b>Valider</b> (/annuler pour arrêter).")
         elif session.state in ("new_tickers", "edit_tickers"):
             tickers = parse_tickers(text)
             if not 1 <= len(tickers) <= MAX_TICKERS or any(len(t) > MAX_TICKER_LEN for t in tickers):
@@ -295,7 +357,11 @@ class BotUI:
         if action == "noop":
             pass
         elif action == "m":
-            await self.show_main(chat_id, message_id)
+            await self.show_main(chat_id, message_id, arg_int(0))
+        elif action == "st":
+            await self.show_status(chat_id, message_id)
+        elif action == "tn":
+            toast, alert = await self.send_test_notification()
         elif action == "n":
             await self.start_creation(chat_id, user_id)
         elif action == "e":

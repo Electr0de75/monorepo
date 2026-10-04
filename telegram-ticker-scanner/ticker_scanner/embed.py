@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import httpx
 
 from .bot import BotUI, TelegramNotifier
+from .checks import check_rpcs
 from .config import Settings, load_settings
 from .db import Database
 from .scanner import Scanner
@@ -50,7 +51,9 @@ async def start_embedded(settings: Settings | None = None) -> ScannerApp:
     api = TelegramAPI(settings.telegram_token, client)
     chat_id = settings.target_chat_id
     notifier = TelegramNotifier(api, chat_id) if chat_id is not None else None
+    warnings = await check_rpcs(settings, client)
     scanner = Scanner(db, settings, client, notifier)
+    scanner.config_warnings = warnings
     bot = BotUI(api, db, scanner, settings, handle_start=False)
     task = asyncio.create_task(scanner.run())
     return ScannerApp(scanner, bot, task, client, db)

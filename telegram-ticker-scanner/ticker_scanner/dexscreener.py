@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.dexscreener.com"
 BATCH = 30
+HEADERS = {"User-Agent": "ticker-scanner/1.0 (+telegram bot)", "Accept": "application/json"}
 
 # dexIds DexScreener uses for bonding-curve launchpads
 LAUNCHPAD_DEX_IDS = {
@@ -61,7 +62,7 @@ class DexScreener:
         for attempt in range(3):
             await self.limiter.wait()
             try:
-                resp = await self.client.get(BASE_URL + path, timeout=20)
+                resp = await self.client.get(BASE_URL + path, timeout=20, headers=HEADERS)
             except httpx.HTTPError as exc:
                 log.debug("dexscreener %s: %s", path, exc)
                 await asyncio.sleep(1 + attempt * 2)
@@ -78,16 +79,20 @@ class DexScreener:
                 return None
         return None
 
-    async def search(self, query: str) -> list[dict]:
+    async def search(self, query: str) -> list[dict] | None:
+        """Pairs matching ``query``; None when DexScreener did not answer."""
         data = await self._get(f"/latest/dex/search?q={quote(query)}")
-        return (data or {}).get("pairs") or []
+        if data is None:
+            return None
+        return _dicts(data.get("pairs")) if isinstance(data, dict) else []
 
     async def pairs(self, chain_id: str, addresses: list[str]) -> list[dict]:
         out: list[dict] = []
         for i in range(0, len(addresses), BATCH):
             chunk = ",".join(addresses[i:i + BATCH])
             data = await self._get(f"/latest/dex/pairs/{chain_id}/{chunk}")
-            out.extend((data or {}).get("pairs") or [])
+            if isinstance(data, dict):
+                out.extend(_dicts(data.get("pairs")))
         return out
 
     async def tokens(self, chain_id: str, addresses: list[str]) -> list[dict]:
@@ -95,8 +100,7 @@ class DexScreener:
         for i in range(0, len(addresses), BATCH):
             chunk = ",".join(addresses[i:i + BATCH])
             data = await self._get(f"/tokens/v1/{chain_id}/{chunk}")
-            if isinstance(data, list):
-                out.extend(data)
+            out.extend(_dicts(data))
         return out
 
 
@@ -117,20 +121,47 @@ def is_known_dex(pair: dict) -> bool:
     return (pair.get("dexId") or "").lower() in KNOWN_DEX_IDS
 
 
+def _dicts(value: Any) -> list[dict]:
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def _num(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _token(pair: dict, side: str) -> dict:
+    token = pair.get(side)
+    return token if isinstance(token, dict) else {}
+
+
+def base_address(pair: dict) -> str | None:
+    address = _token(pair, "baseToken").get("address")
+    return address if isinstance(address, str) else None
+
+
+def base_symbol(pair: dict) -> str | None:
+    symbol = _token(pair, "baseToken").get("symbol")
+    return symbol if isinstance(symbol, str) else None
+
+
 def metrics(pair: dict) -> tuple[float | None, float | None]:
-    liq = (pair.get("liquidity") or {}).get("usd")
-    mc = pair.get("marketCap") or pair.get("fdv")
-    return (float(liq) if liq is not None else None, float(mc) if mc is not None else None)
+    liquidity = pair.get("liquidity")
+    liq = _num(liquidity.get("usd")) if isinstance(liquidity, dict) else None
+    mc = _num(pair.get("marketCap")) or _num(pair.get("fdv"))
+    return liq, mc
 
 
 def pair_to_detection(pair: dict, *, side: str = "baseToken", force_launch: bool = False) -> Detection | None:
     chain = DEXSCREENER_TO_CHAIN.get(pair.get("chainId") or "")
-    token = pair.get(side) or {}
-    other = pair.get("quoteToken" if side == "baseToken" else "baseToken") or {}
-    if chain is None or not token.get("address") or not pair.get("pairAddress"):
+    token = _token(pair, side)
+    other = _token(pair, "quoteToken" if side == "baseToken" else "baseToken")
+    if chain is None or not token.get("address") or not isinstance(pair.get("pairAddress"), str):
         return None
     liq, mc = metrics(pair)
-    created_ms = pair.get("pairCreatedAt")
+    created_ms = _num(pair.get("pairCreatedAt"))
     launch = force_launch or is_launchpad_pair(pair)
     return Detection(
         chain=chain,
@@ -159,4 +190,4 @@ def best_pair(pairs: list[dict], pair_address: str | None, chain: str) -> dict |
         for p in pairs:
             if norm_address(chain, p.get("pairAddress")) == pair_address:
                 return p
-    return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+    return max(pairs, key=lambda p: metrics(p)[0] or 0)

@@ -55,12 +55,21 @@ _RESULT_COLS = (
 )
 
 
+SCHEMA_VERSION = 1
+
+
 class Database:
     def __init__(self, path: str):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise SystemExit(f"{path} vient d'une version plus récente du scanner (schéma {version})")
         self.conn.executescript(_SCHEMA)
+        # Future schema changes go here: `if version < 2: ALTER TABLE …`
+        self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -157,6 +166,17 @@ class Database:
         return row is not None
 
     def insert_result(self, entry_id: int, det: Detection, status: str) -> Result:
+        try:
+            return self._insert_result(entry_id, det, status)
+        except sqlite3.IntegrityError:
+            # Already stored (same entry / chain / key): return the existing row.
+            self.conn.rollback()
+            existing = self.get_result(entry_id, det.chain, det.result_key)
+            if existing is None:
+                raise
+            return existing
+
+    def _insert_result(self, entry_id: int, det: Detection, status: str) -> Result:
         now = time.time()
         cur = self.conn.execute(
             "INSERT INTO results(entry_id, chain, result_key, kind, status, token_address, symbol, name, "

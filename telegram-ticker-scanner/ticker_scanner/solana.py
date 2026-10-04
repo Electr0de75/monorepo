@@ -15,14 +15,16 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import httpx
 
 from .chains import PUMPFUN_CREATE_IXS, PUMPFUN_PROGRAM, SOLANA_LAUNCHPAD_PROGRAMS, SOLANA_QUOTE_MINTS
+from .health import SourceStats
 from .models import LAUNCH, Detection
-from .rpc import HttpRpc, RpcError, WsSubscriptions, default_ws_connect
+from .rpc import HttpRpc, RpcError, WsSubscriptions, cancel_requested, default_ws_connect, next_message
 
 if TYPE_CHECKING:
     from .scanner import Scanner
@@ -123,19 +125,36 @@ def logs_for_program(logs: list[str], program: str) -> ProgramLogs:
     return out
 
 
+def created_accounts(tx: dict) -> set[str]:
+    """Accounts that did not exist before this transaction (0 lamports before, > 0 after)."""
+    meta = tx.get("meta") or {}
+    pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
+    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+    out = set()
+    for i, key in enumerate(keys):
+        pubkey = key.get("pubkey") if isinstance(key, dict) else key
+        if pubkey and i < len(pre) and i < len(post) and pre[i] == 0 and post[i] > 0:
+            out.add(pubkey)
+    return out
+
+
 def new_mints(tx: dict) -> list[str]:
+    """Candidate mints of the token created by `tx`, best first.
+
+    The new token's mint account is created in the transaction, which tells it
+    apart from the quote mint (SOL, USD1, or a stock token on StonkFun).
+    """
     meta = tx.get("meta") or {}
     pre = {b.get("mint") for b in meta.get("preTokenBalances") or []}
-    post = [b.get("mint") for b in meta.get("postTokenBalances") or []]
-    fresh = [m for m in post if m and m not in pre and m not in SOLANA_QUOTE_MINTS]
-    if not fresh:
-        fresh = [m for m in post if m and m not in SOLANA_QUOTE_MINTS]
-    seen, out = set(), []
-    for m in fresh:
-        if m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
+    post: list[str] = []
+    for b in meta.get("postTokenBalances") or []:
+        mint = b.get("mint")
+        if mint and mint not in post and mint not in SOLANA_QUOTE_MINTS:
+            post.append(mint)
+    created = created_accounts(tx)
+    fresh = [m for m in post if m not in pre]
+    ranked = [m for m in fresh if m in created] + [m for m in fresh if m not in created]
+    return ranked or post
 
 
 def instruction_blobs(tx: dict, program: str) -> list[bytes]:
@@ -155,32 +174,60 @@ def instruction_blobs(tx: dict, program: str) -> list[bytes]:
 
 # ---- PumpPortal ---------------------------------------------------------
 class PumpPortalWatcher:
-    def __init__(self, scanner: "Scanner", connect=None, url: str = PUMPPORTAL_URL):
+    # pump.fun creates tokens every few seconds: silence means a dead stream.
+    STALL_TIMEOUT_S = 120
+
+    def __init__(self, scanner: "Scanner", connect=None, url: str = PUMPPORTAL_URL,
+                 stats: SourceStats | None = None):
         self.scanner = scanner
         self.connect = connect or default_ws_connect
         self.url = url
+        self.stats = stats or SourceStats("solana:pumpportal")
+        self.stats.mode = "websocket"
+        self.reconnect_delay = 1.0
+        self.connections = 0
 
     async def run(self) -> None:
-        backoff = 1.0
+        backoff = self.reconnect_delay
         log.info("[solana] PumpPortal démarré")
         while True:
+            started = time.monotonic()
             try:
                 async with self.connect(self.url) as ws:
-                    backoff = 1.0
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
                     await ws.send(json.dumps({"method": "subscribeMigration"}))
-                    async for raw in ws:
+                    self.connections += 1
+                    self.stats.connected = True
+                    iterator = ws.__aiter__()
+                    while True:
                         try:
-                            await self.handle(json.loads(raw))
+                            raw = await next_message(iterator, self.STALL_TIMEOUT_S)
+                        except StopAsyncIteration:
+                            raise ConnectionError("fermé par le serveur") from None
+                        except asyncio.TimeoutError:
+                            raise ConnectionError(f"aucun message depuis {self.STALL_TIMEOUT_S}s") from None
+                        self.stats.event()
+                        try:
+                            msg = json.loads(raw)
                         except ValueError:
                             continue
+                        if not isinstance(msg, dict):
+                            continue
+                        try:
+                            await self.handle(msg)
                         except Exception:  # noqa: BLE001
                             log.exception("[solana] PumpPortal: message illisible")
-                raise ConnectionError("fermé par le serveur")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if cancel_requested():
+                    raise asyncio.CancelledError from exc
+                self.stats.error(str(exc))
                 log.warning("[solana] PumpPortal coupé (%s), reconnexion dans %.0fs", exc, backoff)
+            finally:
+                self.stats.connected = False
+            if time.monotonic() - started > 60:
+                backoff = self.reconnect_delay
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -193,14 +240,18 @@ class PumpPortalWatcher:
             symbol = msg.get("symbol") or ""
             if not self.scanner.is_watched("solana", symbol):
                 return
-            mc_sol = msg.get("marketCapSol")
+            try:
+                mc_sol = float(msg.get("marketCapSol") or 0)
+            except (TypeError, ValueError):
+                mc_sol = 0.0
             pool = msg.get("pool") or "pump"
+            self.stats.detections += 1
             await self.scanner.on_detection(Detection(
                 chain="solana", kind=LAUNCH, token_address=mint, symbol=symbol,
                 name=msg.get("name") or "", pair_address=msg.get("bondingCurveKey"),
                 pool_kind="launchpad", dex=PUMPPORTAL_POOLS.get(pool, pool), source="pumpportal",
                 tx_hash=msg.get("signature"),
-                market_cap_note=f"{float(mc_sol):.1f} SOL" if mc_sol else None,
+                market_cap_note=f"{mc_sol:.1f} SOL" if mc_sol else None,
             ))
         elif tx_type in ("migrate", "migration"):
             if self.scanner.db.has_launch("solana", mint):
@@ -209,9 +260,15 @@ class PumpPortalWatcher:
 
 # ---- Launchpad programs through an RPC websocket ------------------------
 class SolanaLaunchpadWatcher:
+    STALL_TIMEOUT_S = 180
+    TX_FETCH_DELAYS_S = (0.0, 0.7, 2.0, 5.0)
+
     def __init__(self, ws_url: str, http_url: str, scanner: "Scanner", http_client: httpx.AsyncClient,
-                 *, include_pumpfun: bool = False, connect=None, workers: int = 3):
+                 *, include_pumpfun: bool = False, connect=None, workers: int = 3,
+                 stats: SourceStats | None = None):
         self.scanner = scanner
+        self.stats = stats or SourceStats("solana:launchpads")
+        self.stats.mode = "websocket"
         self.rpc = HttpRpc(http_url, http_client, name="solana-rpc")
         self.ws_url = ws_url
         self.connect = connect
@@ -225,6 +282,7 @@ class SolanaLaunchpadWatcher:
         ws = WsSubscriptions(
             self.ws_url, subscribe_method="logsSubscribe", unsubscribe_method="logsUnsubscribe",
             on_message=self._on_message, connect=self.connect, name="solana",
+            stall_timeout=self.STALL_TIMEOUT_S, on_state=self._on_state,
         )
         for program in self.programs:
             ws.set(program, [{"mentions": [program]}, {"commitment": "confirmed"}])
@@ -236,8 +294,14 @@ class SolanaLaunchpadWatcher:
             for t in tasks:
                 t.cancel()
 
+    def _on_state(self, connected: bool) -> None:
+        self.stats.connected = connected
+        if not connected:
+            self.stats.error("websocket déconnecté")
+
     def _on_message(self, program: str, result: dict) -> None:
-        value = (result or {}).get("value") or {}
+        self.stats.event()
+        value = (result or {}).get("value") or {} if isinstance(result, dict) else {}
         if value.get("err") or not value.get("signature"):
             return
         try:
@@ -279,12 +343,21 @@ class SolanaLaunchpadWatcher:
             log.info("[solana] %s: ticker %s trouvé mais mint introuvable (%s)", label, matches[0].symbol, signature)
             return
         hit = matches[0]
+        self.stats.detections += 1
         await self.scanner.on_detection(Detection(
             chain="solana", kind=LAUNCH, token_address=mints[0], symbol=hit.symbol, name=hit.name,
             pool_kind="launchpad", dex=label, source="solana-rpc", tx_hash=signature,
         ))
 
     async def _get_tx(self, signature: str) -> dict | None:
-        return await self.rpc.call("getTransaction", [signature, {
-            "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed",
-        }])
+        # Right after the notification the node may not serve the transaction yet.
+        for delay in self.TX_FETCH_DELAYS_S:
+            if delay:
+                await asyncio.sleep(delay)
+            tx = await self.rpc.call("getTransaction", [signature, {
+                "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed",
+            }])
+            if tx:
+                return tx
+        log.info("[solana] transaction %s introuvable", signature)
+        return None

@@ -50,11 +50,15 @@ class TelegramAPI:
             http_timeout=timeout + 15,
         )
 
-    async def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
+    async def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None,
+                           parse_mode: str | None = "HTML") -> dict:
         return await self.call("sendMessage", {
-            "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            "chat_id": chat_id, "text": text, "parse_mode": parse_mode,
             "link_preview_options": NO_PREVIEW, "reply_markup": reply_markup,
         })
+
+    async def get_me(self) -> dict:
+        return await self.call("getMe")
 
     async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
         try:

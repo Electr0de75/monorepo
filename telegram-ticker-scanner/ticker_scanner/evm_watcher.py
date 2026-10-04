@@ -10,13 +10,15 @@ Per chain it follows three log streams:
   liquidity (v2/v3-style pools are checked with ``balanceOf(pool)``).
 
 Logs come from ``eth_subscribe`` when a websocket URL is configured, else from
-``eth_getLogs`` polling.
+``eth_getLogs`` polling. Pair events are processed before mint events.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -25,8 +27,9 @@ import httpx
 from . import evm_abi as abi
 from .chains import Chain
 from .config import EvmRpc, Settings
+from .health import SourceStats
 from .models import LAUNCH, LIQUIDITY, PAIR, Detection
-from .rpc import HttpRpc, RpcError, WsSubscriptions
+from .rpc import NODE, REVERT, HttpRpc, RpcError, WsSubscriptions, cancel_requested
 
 if TYPE_CHECKING:
     from .scanner import Scanner
@@ -35,6 +38,11 @@ log = logging.getLogger(__name__)
 
 MAX_BACKFILL_BLOCKS = 600
 BALANCE_POOL_KINDS = ("v2", "v3", "solidly", "slipstream")
+WS_STALL_TIMEOUT_S = 180
+# Priority of each stream in the work queue (lower = first).
+PRIORITY = {"pairs": 0, "v4liq": 0, "mints": 1}
+# How often a pool still waiting for liquidity is checked, by age.
+PENDING_SCHEDULE = ((600, 6.0), (3600, 30.0), (float("inf"), 120.0))
 
 
 class LRU(OrderedDict):
@@ -54,7 +62,7 @@ def _hex_int(value: str | None) -> int:
         return 0
     try:
         return int(value, 16)
-    except ValueError:
+    except (TypeError, ValueError):
         return 0
 
 
@@ -62,9 +70,17 @@ def short(addr: str) -> str:
     return f"{addr[:6]}…{addr[-4:]}"
 
 
+def pending_interval(age_s: float) -> float:
+    for max_age, interval in PENDING_SCHEDULE:
+        if age_s < max_age:
+            return interval
+    return PENDING_SCHEDULE[-1][1]
+
+
 class EvmWatcher:
     def __init__(self, chain: Chain, rpc_cfg: EvmRpc, scanner: "Scanner", settings: Settings,
-                 http_client: httpx.AsyncClient, ws_connect=None, workers: int = 4):
+                 http_client: httpx.AsyncClient, ws_connect=None, workers: int = 4,
+                 stats: SourceStats | None = None):
         self.chain = chain
         self.scanner = scanner
         self.settings = settings
@@ -72,13 +88,18 @@ class EvmWatcher:
         self.ws_url = rpc_cfg.ws_url
         self.ws_connect = ws_connect
         self.n_workers = workers
+        self.stats = stats or SourceStats(f"evm:{chain.key}")
+        self.stats.mode = "websocket" if self.ws_url else "polling HTTP"
         self.symbols: LRU = LRU(200_000)       # address -> symbol ("" = not a token)
         self.seen_mints: LRU = LRU(500_000)    # token addresses already processed
         self._inflight: dict[str, asyncio.Future] = {}
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=50_000)
+        self._seq = itertools.count()
+        self._dropped = 0
         self.last_block: int | None = None
         self.filters: dict[str, dict | None] = {}
         self._ws: WsSubscriptions | None = None
+        self._next_check: dict[int, float] = {}
 
         self.dex_by_address: dict[str, tuple[str, str]] = {}
         for kind, table in (
@@ -119,14 +140,14 @@ class EvmWatcher:
             self.set_filter(name, flt)
         tasks = [asyncio.create_task(self._worker()) for _ in range(self.n_workers)]
         tasks.append(asyncio.create_task(self._liquidity_loop()))
-        mode = "websocket" if self.ws_url else "polling HTTP"
-        log.info("[%s] watcher on-chain démarré (%s)", self.chain.key, mode)
+        log.info("[%s] watcher on-chain démarré (%s)", self.chain.key, self.stats.mode)
         try:
             if self.ws_url:
                 self._ws = WsSubscriptions(
                     self.ws_url, subscribe_method="eth_subscribe", unsubscribe_method="eth_unsubscribe",
                     on_message=self._on_ws_message, on_connect=self._backfill,
-                    connect=self.ws_connect, name=self.chain.key,
+                    connect=self.ws_connect, name=self.chain.key, stall_timeout=WS_STALL_TIMEOUT_S,
+                    on_state=self._on_ws_state,
                 )
                 for name, flt in self.filters.items():
                     self._ws.set(name, ["logs", flt] if flt else None)
@@ -134,9 +155,15 @@ class EvmWatcher:
             else:
                 await self._poll_loop()
         finally:
+            self.stats.connected = False
             for t in tasks:
                 t.cancel()
             log.info("[%s] watcher on-chain arrêté", self.chain.key)
+
+    def _on_ws_state(self, connected: bool) -> None:
+        self.stats.connected = connected
+        if not connected:
+            self.stats.error("websocket déconnecté")
 
     def _on_ws_message(self, name: str, lg: dict) -> None:
         self._enqueue(name, lg, track=True)
@@ -144,14 +171,31 @@ class EvmWatcher:
     def _enqueue(self, name: str, lg: dict, track: bool) -> None:
         if not isinstance(lg, dict) or lg.get("removed"):
             return
+        self.stats.event()
         if track and lg.get("blockNumber"):
             block = _hex_int(lg["blockNumber"])
             if self.last_block is None or block > self.last_block:
                 self.last_block = block
         try:
-            self.queue.put_nowait((name, lg))
+            self.queue.put_nowait((PRIORITY.get(name, 1), next(self._seq), name, lg))
         except asyncio.QueueFull:
-            log.warning("[%s] file pleine, log ignoré", self.chain.key)
+            self._dropped += 1
+            if self._dropped in (1, 10, 100) or self._dropped % 1000 == 0:
+                log.warning("[%s] file pleine, %d logs ignorés", self.chain.key, self._dropped)
+
+    async def _get_logs(self, flt: dict, start: int, end: int) -> list[dict]:
+        """eth_getLogs that splits the range when the node refuses it (too large / too many results)."""
+        try:
+            return await self.rpc.call("eth_getLogs", [{**flt, "fromBlock": hex(start), "toBlock": hex(end)}]) or []
+        except RpcError as exc:
+            if exc.kind != NODE:
+                raise  # network / rate limit: retry the same range later
+            if start >= end:
+                log.warning("[%s] eth_getLogs refusé pour le bloc %d, ignoré: %s", self.chain.key, start, exc)
+                self.stats.error(str(exc))
+                return []
+            mid = (start + end) // 2
+            return await self._get_logs(flt, start, mid) + await self._get_logs(flt, mid + 1, end)
 
     async def _fetch_range(self, start: int, end: int) -> None:
         step = max(1, self.settings.evm_getlogs_max_range)
@@ -161,41 +205,53 @@ class EvmWatcher:
             for name, flt in list(self.filters.items()):
                 if not flt:
                     continue
-                logs = await self.rpc.call("eth_getLogs", [{**flt, "fromBlock": hex(a), "toBlock": hex(b)}])
-                for lg in logs or []:
+                for lg in await self._get_logs(flt, a, b):
                     self._enqueue(name, lg, track=False)
             a = b + 1
 
+    def _range_start(self, since: int, latest: int) -> int:
+        start = since + 1
+        if latest - start > MAX_BACKFILL_BLOCKS:
+            skipped = latest - MAX_BACKFILL_BLOCKS - start
+            log.warning("[%s] retard de %d blocs, les plus anciens sont ignorés", self.chain.key, skipped)
+            start = latest - MAX_BACKFILL_BLOCKS
+        return start
+
     async def _backfill(self) -> None:
         """After a websocket reconnect, fetch the logs emitted while we were away."""
-        if self.last_block is None:
+        since = self.last_block  # snapshot before live logs move it forward
+        if since is None:
             return
         try:
             latest = _hex_int(await self.rpc.call("eth_blockNumber"))
-            start = max(self.last_block + 1, latest - MAX_BACKFILL_BLOCKS)
-            if start <= latest:
-                await self._fetch_range(start, latest)
+            if latest > since:
+                await self._fetch_range(self._range_start(since, latest), latest)
         except RpcError as exc:
             log.warning("[%s] rattrapage impossible: %s", self.chain.key, exc)
+            self.stats.error(f"rattrapage: {exc}")
 
     async def _poll_loop(self) -> None:
         while True:
             try:
                 latest = _hex_int(await self.rpc.call("eth_blockNumber"))
+                self.stats.connected = True
                 if self.last_block is None:
                     self.last_block = latest
                 elif latest > self.last_block:
-                    start = max(self.last_block + 1, latest - MAX_BACKFILL_BLOCKS)
-                    await self._fetch_range(start, latest)
+                    await self._fetch_range(self._range_start(self.last_block, latest), latest)
                     self.last_block = latest
             except RpcError as exc:
+                if cancel_requested():
+                    raise asyncio.CancelledError from exc
+                self.stats.connected = False
+                self.stats.error(str(exc))
                 log.warning("[%s] polling: %s", self.chain.key, exc)
             await asyncio.sleep(self.settings.evm_poll_interval)
 
     async def _worker(self) -> None:
         handlers = {"pairs": self.handle_pair, "mints": self.handle_mint, "v4liq": self.handle_v4_liquidity}
         while True:
-            name, lg = await self.queue.get()
+            _, _, name, lg = await self.queue.get()
             handler = handlers.get(name)
             if handler is None:
                 continue
@@ -219,19 +275,20 @@ class EvmWatcher:
             return await self._inflight[address]
         fut = asyncio.get_running_loop().create_future()
         self._inflight[address] = fut
+        symbol = ""
         try:
-            try:
-                res = await self.rpc.call("eth_call", [{"to": address, "data": abi.SEL_SYMBOL}, "latest"])
-                symbol = abi.decode_string_result(res) or ""
-                self.symbols.put(address, symbol)
-            except RpcError as exc:
-                symbol = ""
-                if not exc.transient:  # reverted: not an ERC-20
-                    self.symbols.put(address, "")
-            fut.set_result(symbol)
-            return symbol
+            res = await self.rpc.call("eth_call", [{"to": address, "data": abi.SEL_SYMBOL}, "latest"])
+            symbol = abi.decode_string_result(res) or ""
+            self.symbols.put(address, symbol)
+        except RpcError as exc:
+            if exc.kind == REVERT:  # symbol() reverted: not an ERC-20
+                self.symbols.put(address, "")
         finally:
+            # Always release the other workers waiting for this address.
             self._inflight.pop(address, None)
+            if not fut.done():
+                fut.set_result(symbol)
+        return symbol
 
     async def token_name(self, address: str) -> str:
         try:
@@ -283,7 +340,7 @@ class EvmWatcher:
             return
         self.seen_mints.put(token, True)
         symbol = await self.token_symbol(token)
-        if token not in self.symbols:  # transient RPC failure: retry on its next mint
+        if token not in self.symbols:  # RPC failure: retry on its next mint
             self.seen_mints.pop(token, None)
             return
         if not symbol or not self.scanner.is_watched(self.chain.key, symbol):
@@ -293,6 +350,7 @@ class EvmWatcher:
         name = await self.token_name(token)
         minted_to = abi.topic_address(topics[2])
         label = await self._launchpad_label(lg.get("transactionHash"), minted_to)
+        self.stats.detections += 1
         await self.scanner.on_detection(Detection(
             chain=self.chain.key, kind=LAUNCH, token_address=token, symbol=symbol, name=name,
             pool_kind="launchpad", dex=label, source="onchain", tx_hash=lg.get("transactionHash"),
@@ -320,7 +378,7 @@ class EvmWatcher:
             return kind, dex, abi.topic_address(topics[2]), abi.topic_address(topics[3]), topics[1].lower(), hooks
         else:
             return None
-        if not pool:
+        if not pool or pool == abi.ZERO_ADDRESS:
             return None
         return kind, dex, abi.topic_address(topics[1]), abi.topic_address(topics[2]), pool.lower(), None
 
@@ -340,6 +398,7 @@ class EvmWatcher:
             tx = lg.get("transactionHash")
             has_liq = await self.liquidity_in_tx(tx, kind, pool)
             launchpad = self.chain.v4_hooks.get(hooks or "")
+            self.stats.detections += 1
             await self.scanner.on_detection(Detection(
                 chain=self.chain.key, kind=LAUNCH if launchpad else PAIR, token_address=token,
                 symbol=symbol, name=name, pair_address=pool, pool_kind=kind,
@@ -376,14 +435,15 @@ class EvmWatcher:
         if abi.word_int(lg.get("data"), 2) <= 0:
             return
         pool_id = topics[1].lower()
-        for res in self.scanner.db.find_results(self.chain.key, pool_id):
+        results = self.scanner.db.find_results(self.chain.key, pool_id)
+        if results:
             await self.scanner.on_detection(Detection(
-                chain=self.chain.key, kind=LIQUIDITY, token_address=res.token_address,
+                chain=self.chain.key, kind=LIQUIDITY, token_address=results[0].token_address,
                 pair_address=pool_id, source="onchain", tx_hash=lg.get("transactionHash"),
             ))
-            break
 
-    async def check_pending_liquidity(self) -> None:
+    async def check_pending_liquidity(self, now: float | None = None) -> None:
+        now = now or time.time()
         max_age = self.settings.pending_liquidity_max_age_h * 3600
         pending = self.scanner.db.pending_results(max_age, chains=[self.chain.key])
         v4_ids = sorted({r.pair_address for r in pending if r.pool_kind == "v4" and r.pair_address})
@@ -394,10 +454,16 @@ class EvmWatcher:
             })
         else:
             self.set_filter("v4liq", None)
+        live_ids = {r.id for r in pending}
+        for stale in [rid for rid in self._next_check if rid not in live_ids]:
+            del self._next_check[stale]
         seen: set[tuple[str, str]] = set()
         for res in pending:
             if res.pool_kind not in BALANCE_POOL_KINDS or not res.pair_address:
                 continue
+            if self._next_check.get(res.id, 0) > now:
+                continue
+            self._next_check[res.id] = now + pending_interval(now - res.found_at)
             key = (res.token_address, res.pair_address)
             if key in seen:
                 continue

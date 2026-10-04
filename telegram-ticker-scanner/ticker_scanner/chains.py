@@ -20,6 +20,7 @@ class Chain:
     kind: str  # "evm" | "solana"
     dexscreener: str
     native_symbol: str = "ETH"
+    chain_id: int | None = None  # checked against eth_chainId at startup
     gmgn: str | None = None
     defined: str | None = None
     env_prefix: str | None = None
@@ -72,7 +73,7 @@ _CHAINS: list[Chain] = [
         dexscreener="solana", native_symbol="SOL", gmgn="sol", defined="sol",
     ),
     _evm(
-        key="bsc", label="BSC", dexscreener="bsc", native_symbol="BNB", gmgn="bsc", defined="bsc", env_prefix="BSC",
+        key="bsc", label="BSC", dexscreener="bsc", native_symbol="BNB", chain_id=56, gmgn="bsc", defined="bsc", env_prefix="BSC",
         v2_factories={
             "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73": "PancakeSwap v2",
             "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6": "Uniswap v2",
@@ -96,7 +97,7 @@ _CHAINS: list[Chain] = [
         },
     ),
     _evm(
-        key="robinhood", label="Robinhood", dexscreener="robinhood", gmgn="robinhood",
+        key="robinhood", label="Robinhood", dexscreener="robinhood", chain_id=4663, gmgn="robinhood",
         defined="robinhood", env_prefix="ROBINHOOD",
         v2_factories={"0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f": "Uniswap v2"},
         v3_factories={"0x1f7d7550b1b028f7571e69a784071f0205fd2efa": "Uniswap v3"},
@@ -116,7 +117,7 @@ _CHAINS: list[Chain] = [
         quote_tokens={"0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73": "WETH"},
     ),
     _evm(
-        key="ethereum", label="Ethereum", dexscreener="ethereum", gmgn="eth", defined="eth",
+        key="ethereum", label="Ethereum", dexscreener="ethereum", chain_id=1, gmgn="eth", defined="eth",
         env_prefix="ETHEREUM",
         v2_factories={
             "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f": "Uniswap v2",
@@ -134,7 +135,7 @@ _CHAINS: list[Chain] = [
         },
     ),
     _evm(
-        key="base", label="Base", dexscreener="base", gmgn="base", defined="base",
+        key="base", label="Base", dexscreener="base", chain_id=8453, gmgn="base", defined="base",
         env_prefix="BASE",
         v2_factories={"0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6": "Uniswap v2"},
         v3_factories={
@@ -150,7 +151,7 @@ _CHAINS: list[Chain] = [
         },
     ),
     _evm(
-        key="arbitrum", label="Arbitrum", dexscreener="arbitrum", defined="arb",
+        key="arbitrum", label="Arbitrum", dexscreener="arbitrum", chain_id=42161, defined="arb",
         env_prefix="ARBITRUM",
         v2_factories={
             "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9": "Uniswap v2",

@@ -65,7 +65,7 @@ class ModelsTest(unittest.TestCase):
                     self.assertEqual(len(address), 42, address)
 
     def test_settings(self):
-        s = load_settings({"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_ALLOWED_USERS": "12, 34",
+        s = load_settings({"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_ALLOWED_USERS": "12, 34",
                            "BSC_WS_URL": "wss://bnb.example/v2/k", "SOLANA_WS_URL": "wss://sol.example/?api-key=k"})
         self.assertEqual(s.target_chat_id, 12)
         self.assertEqual(s.evm_rpc["bsc"].http_url, "https://bnb.example/v2/k")

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import html
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .chains import CHAINS, chain_label
+from .health import SourceStats
 from .models import (
     LABEL_LAUNCH, LABEL_LIQ, LABEL_PAIR, STATUS_LAUNCH, STATUS_LIQ, STATUS_PAIR, Entry, Result,
 )
@@ -19,6 +21,7 @@ LABEL_TEXT = {
 }
 STATUS_EMOJI = {STATUS_LAUNCH: "🟣", STATUS_PAIR: "🟡", STATUS_LIQ: "🟢"}
 RULE = "━" * 22
+TELEGRAM_LIMIT = 4096
 # Prefix of every callback_data, so the scanner can share a bot with other handlers.
 CB = "sc:"
 
@@ -86,8 +89,11 @@ def links_keyboard(res: Result) -> list[list[dict]]:
 
 
 # ---- notifications ------------------------------------------------------
-def notification_text(entry: Entry, res: Result, labels: list[str], note: str | None = None) -> str:
+def notification_text(entry: Entry, res: Result, labels: list[str], note: str | None = None,
+                      test: bool = False) -> str:
     title = " + ".join(LABEL_TEXT[lbl] for lbl in labels)
+    if test:
+        title = "🧪 NOTIF DE TEST\n" + title
     where = res.dex or "—"
     if res.quote_symbol and res.status != STATUS_LAUNCH:
         where += f" · /{res.quote_symbol}"
@@ -130,20 +136,33 @@ def chains_text(chains: list[str]) -> str:
     return ", ".join(chain_label(c) for c in chains) or "—"
 
 
-def main_menu(entries: list[Entry], counts: dict[int, tuple[int, int]], sources: list[str]) -> tuple[str, dict]:
+MENU_PAGE_SIZE = 10
+
+
+def main_menu(entries: list[Entry], counts: dict[int, tuple[int, int]], sources: list[str],
+              page: int = 0) -> tuple[str, dict]:
     active = sum(1 for e in entries if e.active)
     text = ["🛰 <b>Scanner de tickers</b>", f"{len(entries)} projet(s) · {active} actif(s)"]
     if sources:
         text.append(f"⚡ Temps réel : {esc(', '.join(sources))}")
     if not entries:
         text.append("\nAucun projet pour l'instant. Ajoute-en un 👇")
+    pages = max(1, (len(entries) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
+    page = min(max(0, page), pages - 1)
     rows = []
-    for e in entries:
+    for e in entries[page * MENU_PAGE_SIZE:(page + 1) * MENU_PAGE_SIZE]:
         total, _ = counts.get(e.id, (0, 0))
         icon = "▶️" if e.active else "⏸"
         rows.append([{"text": f"{icon} {e.name} · {tickers_text(e)} ({total})"[:64], "callback_data": f"{CB}e:{e.id}"}])
+    if pages > 1:
+        rows.append([
+            {"text": "◀️", "callback_data": f"{CB}m:{max(0, page - 1)}"},
+            {"text": f"{page + 1}/{pages}", "callback_data": f"{CB}noop"},
+            {"text": "▶️", "callback_data": f"{CB}m:{min(pages - 1, page + 1)}"},
+        ])
     rows.append([{"text": "➕ Nouveau projet", "callback_data": f"{CB}n"}])
-    rows.append([{"text": "🔄 Actualiser", "callback_data": f"{CB}m"}])
+    rows.append([{"text": "🔄 Actualiser", "callback_data": f"{CB}m:{page}"},
+                 {"text": "🩺 État", "callback_data": f"{CB}st"}])
     return "\n".join(text), {"inline_keyboard": rows}
 
 
@@ -265,12 +284,17 @@ def results_page(entry: Entry, results: list[Result], page: int, page_size: int,
     rows.append([{"text": "🔄 Refresh (MC & liq)", "callback_data": f"{CB}rf:{entry.id}:{page}"}])
     rows.append([{"text": "⬅️ Retour au projet", "callback_data": f"{CB}e:{entry.id}"}])
     legend = "\n<i>🟣 token créé · 🟡 pair créée · 🟢 liquidité ajoutée — tape un contrat pour le copier</i>"
-    return "\n\n".join(blocks) + "\n" + legend, {"inline_keyboard": rows}
+    text = "\n\n".join(blocks) + "\n" + legend
+    while len(text) > TELEGRAM_LIMIT and len(blocks) > 2:
+        blocks.pop()  # never exceed Telegram's limit: drop the last items of the page
+        text = "\n\n".join(blocks) + "\n\n<i>… (page tronquée)</i>"
+    return text, {"inline_keyboard": rows}
 
 
 HELP = (
     "🛰 <b>Scanner de tickers</b>\n\n"
     "/scanner — liste des projets surveillés\n"
+    "/scanner_etat — santé des sources + notif de test\n"
     "/nouveau — ajouter un projet (nom, 1 à 3 tickers, blockchains)\n"
     "/annuler — annuler la saisie en cours\n\n"
     "Notifications :\n"
@@ -278,3 +302,77 @@ HELP = (
     "🟡 <b>PAIR CREATED</b> — pair / pool créée sur un DEX\n"
     "🟢 <b>LIQ ADDED</b> — liquidité ajoutée à la pair"
 )
+
+
+def html_to_text(text: str) -> str:
+    """Plain-text fallback of an HTML message."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def sample_notification() -> tuple[Entry, Result]:
+    """A realistic fake result for the test notification (WBNB on BSC, so links work)."""
+    now = time.time()
+    entry = Entry(id=0, name="Test", tickers=["TEST"], chains=["bsc"], paused=False,
+                  created_at=now, scan_since=now)
+    result = Result(
+        id=0, entry_id=0, chain="bsc", result_key="test", kind="pair", status=STATUS_LIQ,
+        token_address="0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", symbol="TEST", name="Test Token",
+        pair_address="0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae", pool_kind="v2", dex="PancakeSwap v2",
+        quote_symbol="WBNB", quote_address=None, source="test", tx_hash=None, found_at=now, liq_at=now,
+        liquidity_usd=42000.0, market_cap=250000.0, updated_at=now,
+    )
+    return entry, result
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days} j {hours} h"
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    return f"{minutes} min"
+
+
+STATE_ICON = {"ok": "✅", "stale": "⚠️", "down": "❌"}
+
+
+def status_page(stats: list[SourceStats], *, started_at: float, sent: int, failed: int,
+                notify_chat: int | None, warnings: list[str], has_entries: bool) -> tuple[str, dict]:
+    now = time.time()
+    lines = [
+        "🩺 <b>État du scanner</b>",
+        f"En ligne depuis {fmt_duration(now - started_at)}",
+        f"Notifications : {sent} envoyée(s) · {failed} perdue(s)",
+        "Chat des notifs : " + (f"<code>{notify_chat}</code> ✅" if notify_chat is not None
+                                 else "❌ non configuré (TELEGRAM_NOTIFY_CHAT_ID)"),
+        "",
+        "<b>Sources</b>",
+    ]
+    if not has_entries:
+        lines.append("Aucune source active : ajoute ou réactive un projet.")
+    for st in stats:
+        state = st.state(now)
+        parts = [f"{STATE_ICON[state]} <b>{esc(st.name)}</b> — {esc(st.mode)}"]
+        if st.events:
+            parts.append(f"{st.events:,} évén.".replace(",", " "))
+        if st.last_event:
+            parts.append(f"dernier {fmt_age(st.last_event, now)}")
+        elif state != "down":
+            parts.append("en attente du 1er événement")
+        if st.detections:
+            parts.append(f"{st.detections} détection(s)")
+        lines.append(" · ".join(parts))
+        if state != "ok" and st.last_error:
+            lines.append(f"   ↳ {esc(st.last_error)} ({fmt_age(st.last_error_at or now, now)})")
+    if warnings:
+        lines += ["", "<b>Avertissements</b>"] + [f"⚠️ {esc(w)}" for w in warnings]
+    lines += ["", "<i>✅ ok · ⚠️ rien reçu depuis 3 min · ❌ déconnecté</i>"]
+    rows = [
+        [{"text": "🔔 Envoyer une notif de test", "callback_data": f"{CB}tn"}],
+        [{"text": "🔄 Actualiser", "callback_data": f"{CB}st"},
+         {"text": "⬅️ Projets", "callback_data": f"{CB}m"}],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
