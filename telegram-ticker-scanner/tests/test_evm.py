@@ -227,7 +227,10 @@ class EvmWatcherTest(unittest.IsolatedAsyncioTestCase):
                 break
         await asyncio.sleep(0.05)
         self.assertTrue(watcher._ws.connected)
-        self.assertEqual(ws.sub_counter, 1)  # "pairs" subscribed, "mints" refused, no reconnect loop
+        # address-less filters ("mints", "v3mints") refused; the others subscribed; no reconnect loop
+        expected = sum(1 for f in watcher.base_filters().values() if "address" in f)
+        self.assertEqual(ws.sub_counter, expected)
+        self.assertEqual(watcher._ws.connections, 1)
         task.cancel()
 
 

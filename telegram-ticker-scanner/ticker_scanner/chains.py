@@ -29,6 +29,8 @@ class Chain:
     v2_factories: dict[str, str] = field(default_factory=dict)
     v3_factories: dict[str, str] = field(default_factory=dict)
     v4_pool_managers: dict[str, str] = field(default_factory=dict)
+    # Uniswap v4 PositionManager: maps pool ids to their tokens (poolKeys)
+    v4_position_manager: str | None = None
     # Solidly forks (Aerodrome v2) and Slipstream (Aerodrome CL)
     solidly_factories: dict[str, str] = field(default_factory=dict)
     slipstream_factories: dict[str, str] = field(default_factory=dict)
@@ -57,6 +59,8 @@ def _lower(d: dict[str, str]) -> dict[str, str]:
 
 
 def _evm(**kw) -> Chain:
+    if kw.get("v4_position_manager"):
+        kw["v4_position_manager"] = kw["v4_position_manager"].lower()
     for name in (
         "v2_factories", "v3_factories", "v4_pool_managers", "solidly_factories",
         "slipstream_factories", "launchpads", "v4_hooks", "quote_tokens",
@@ -84,6 +88,7 @@ _CHAINS: list[Chain] = [
             "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7": "Uniswap v3",
         },
         v4_pool_managers={"0x28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF": "Uniswap v4"},
+        v4_position_manager="0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b",
         launchpads={
             "0x5c952063c7fc8610FFDB798152D69F0B9550762b": "four.meme",
             "0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0": "Flap",
@@ -103,6 +108,7 @@ _CHAINS: list[Chain] = [
         v2_factories={"0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f": "Uniswap v2"},
         v3_factories={"0x1f7d7550b1b028f7571e69a784071f0205fd2efa": "Uniswap v3"},
         v4_pool_managers={"0x8366a39cc670b4001a1121b8f6a443a643e40951": "Uniswap v4"},
+        v4_position_manager="0x58daec3116aae6d93017baaea7749052e8a04fa7",
         launchpads={
             "0x26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09": "Flap",
             "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e": "Pons",
@@ -129,6 +135,7 @@ _CHAINS: list[Chain] = [
             PANCAKE_V3_FACTORY: "PancakeSwap v3",
         },
         v4_pool_managers={"0x000000000004444c5dc75cB358380D2e3dE08A90": "Uniswap v4"},
+        v4_position_manager="0xbD216513d74C8cf14cf4747E6AaA6420fF64ee9e",
         quote_tokens={
             "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2": "WETH",
             "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": "USDC",
@@ -144,6 +151,7 @@ _CHAINS: list[Chain] = [
             PANCAKE_V3_FACTORY: "PancakeSwap v3",
         },
         v4_pool_managers={"0x498581fF718922c3f8e6A244956aF099B2652b2b": "Uniswap v4"},
+        v4_position_manager="0x7C5f5A4bBd8fD63184577525326123B519429bDc",
         solidly_factories={"0x420DD381b31aEf6683db6B902084cB0FFECe40Da": "Aerodrome"},
         slipstream_factories={"0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A": "Aerodrome CL"},
         quote_tokens={
@@ -163,6 +171,7 @@ _CHAINS: list[Chain] = [
             PANCAKE_V3_FACTORY: "PancakeSwap v3",
         },
         v4_pool_managers={"0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32": "Uniswap v4"},
+        v4_position_manager="0xd88F38F930b7952f2DB2432Cb002E7abbF3dD869",
         quote_tokens={
             "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1": "WETH",
             "0xaf88d065e77c8cC2239327C5EDb3A432268e5831": "USDC",

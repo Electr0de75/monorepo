@@ -188,7 +188,9 @@ class EntryPointFuzzTest(unittest.IsolatedAsyncioTestCase):
     async def test_random_logs_never_crash_the_watcher(self):
         rng = random.Random(SEED + 4)
         factories = list(self.watcher.dex_by_address)
-        topics0 = [abi.V2_PAIR_CREATED, abi.V3_POOL_CREATED, abi.V4_INITIALIZE, abi.TRANSFER, rand_str(rng)]
+        topics0 = [abi.V2_PAIR_CREATED, abi.V3_POOL_CREATED, abi.V4_INITIALIZE, abi.TRANSFER, abi.V3_MINT,
+                   abi.V4_MODIFY_LIQUIDITY, rand_str(rng)]
+        factories += list(CHAINS["bsc"].v4_pool_managers)
         for _ in range(ITERATIONS):
             lg = {
                 "address": rng.choice(factories + ["0x%040x" % rng.getrandbits(160), rand_str(rng), None]),
@@ -199,10 +201,11 @@ class EntryPointFuzzTest(unittest.IsolatedAsyncioTestCase):
             }
             if rng.random() < 0.1:
                 lg = rand_value(rng)
-            for handler in (self.watcher.handle_pair, self.watcher.handle_mint, self.watcher.handle_v4_liquidity):
+            for handler in (self.watcher.handle_pair, self.watcher.handle_mint, self.watcher.handle_v4_liquidity,
+                            self.watcher.handle_v3_mint):
                 if isinstance(lg, dict):
                     await handler(lg)
-            self.watcher._enqueue(rng.choice(["pairs", "mints", "v4liq", "?"]), lg, track=True)
+            self.watcher._enqueue(rng.choice(["pairs", "mints", "v4liq", "v3mints", "?"]), lg, track=True)
 
     async def test_random_telegram_updates_never_raise(self):
         rng = random.Random(SEED + 5)

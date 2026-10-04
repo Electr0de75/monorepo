@@ -80,7 +80,12 @@ Chaque chaîne est scannée via **DexScreener** (toutes les chaînes, sans clé,
 **Liquidité** : après un 🟡 PAIR CREATED, le scanner surveille la pair pendant 72 h et t'envoie 🟢 LIQ ADDED dès que de la liquidité réelle arrive. Pour les pairs v2, il vérifie les réserves, et pas seulement des jetons envoyés à la pair.
 
 **Lancement furtif** : l'équipe crée la pair des jours avant et n'ajoute la liquidité qu'au lancement. Le scanner l'attrape même si la pair existait avant ton projet :
-- **en temps réel on-chain** : la toute première liquidité d'une pair v2 (Uniswap, PancakeSwap, SushiSwap et leurs forks, même une factory inconnue) laisse une empreinte unique. Le scanner la repère et envoie 🟢 LIQ ADDED ;
+- **en temps réel on-chain, v2, v3 et v4**. Dans les trois cas, la factory peut être inconnue et le pool ancien :
+  - **v2** (Uniswap, PancakeSwap, SushiSwap et leurs forks) : la toute première liquidité d'une pair laisse une empreinte unique ;
+  - **v3** (Uniswap, PancakeSwap, Aerodrome CL et leurs forks) : chaque ajout de liquidité sur un pool est écouté. Si le pool ne contenait aucun de ses deux tokens au bloc précédent, c'est sa première liquidité ;
+  - **v4** (Uniswap v4) : chaque ajout de liquidité sur le PoolManager est écouté. Les tokens du pool viennent du PositionManager d'Uniswap. La clé est vérifiée par hachage, donc un contrat malveillant ne peut pas faire passer un faux pool. L'état du pool au bloc précédent est lu directement dans le stockage du contrat. Sur un pool de launchpad (hook Pons), l'alerte est un 🟣 TOKEN CREATED.
+
+  Un pool déjà actif n'est jamais signalé : seule sa toute première liquidité compte. Le scanner envoie 🟢 LIQ ADDED, ou 🟡 + 🟢 si le pool a été créé dans la même transaction ;
 - **via DexScreener** : à l'ajout d'un ticker, le scanner photographie les pairs déjà existantes. Toute pair absente de cette photo qui apparaît ensuite est signalée, même si sa date de création est ancienne.
 
 **Anti-flood** : quand un ticker est à la mode, des dizaines de copies sortent en quelques minutes. Au-delà de 15 alertes en 10 min pour un même projet, les suivantes sont regroupées dans un résumé. Celles avec plus de 10 000 $ de liquidité passent toujours, et tout reste dans 📋 Résultats. Les deux seuils se règlent dans `.env`.
@@ -163,7 +168,10 @@ Le scanner est conçu pour tourner des semaines sans surveillance.
 - **Latence** :
   - **EVM** : les appels RPC nécessaires après un ticker reconnu (nom, contrôle de nouveauté, reçu) partent en parallèle. Le reçu est mis en cache et partagé entre les détecteurs. Les events de pairs passent avant le flux de mints.
   - **DexScreener** : jusqu'à 4 recherches en parallèle, dans la limite de 250 requêtes/min.
-- **Débit mesuré** : environ 2 800 logs EVM/s et environ 3 600 transactions Solana/s analysées. Il faut exactement 1 appel RPC par nouveau token, et 0 pour un token déjà vu.
+- **Débit mesuré** :
+  - environ 2 800 logs de mint EVM/s, avec 1 appel RPC par nouveau token et 0 pour un token déjà vu ;
+  - environ 6 800 ajouts de liquidité v3/s, avec 3 appels RPC par nouveau pool et 0 ensuite ;
+  - environ 3 600 transactions Solana/s analysées.
 - **Mémoire bornée** : environ 35 Mo maximum par chaîne, quelle que soit la durée de fonctionnement.
 - **Accélérateurs optionnels** : `pip install uvloop orjson`. Ils sont utilisés automatiquement s'ils sont installés.
 
@@ -174,8 +182,8 @@ python -m unittest discover -s tests -t .
 FUZZ_ITERATIONS=20000 python -m unittest tests.test_fuzz   # fuzzing approfondi
 ```
 
-Les 124 tests passent sur Python 3.10, 3.11, 3.12 et 3.13. Ils simulent le RPC EVM, les websockets, DexScreener, PumpPortal, Solana et Telegram, et couvrent :
+Les 142 tests passent sur Python 3.10, 3.11, 3.12 et 3.13. Ils simulent le RPC EVM, les websockets, DexScreener, PumpPortal, Solana et Telegram, et couvrent :
 - **bout en bout** : création d'un projet depuis Telegram, démarrage des sources, notification reçue ;
 - **chaos** : l'application complète contre des services qui tombent en panne au hasard (environ 30 % d'erreurs 5xx, 429 et réseau), avec websockets coupés et événements rejoués. La notification arrive exactement une fois, rien ne plante ;
 - **fuzzing** : des milliers d'entrées aléatoires et malveillantes envoyées à chaque parseur et à chaque point d'entrée (logs EVM, transactions Solana, PumpPortal, DexScreener, updates Telegram). Aucun plantage, et le HTML produit est toujours valide pour Telegram ;
-- **robustesse et sécurité** : coupures, rate-limits, annulations concurrentes, conflits Telegram, adresses forgées, secrets, lancements furtifs, anti-flood.
+- **robustesse et sécurité** : coupures, rate-limits, annulations concurrentes, conflits Telegram, adresses forgées, secrets, lancements furtifs (v2, v3, v4), clés de pool v4 usurpées, anti-flood.

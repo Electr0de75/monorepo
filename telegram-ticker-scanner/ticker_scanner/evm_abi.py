@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .keccak import keccak_hex, selector
+from .keccak import keccak256, keccak_hex, selector
 
 ZERO_ADDRESS = "0x" + "0" * 40
 ZERO_TOPIC = "0x" + "0" * 64
@@ -25,6 +25,14 @@ SEL_TOKEN0 = selector("token0()")
 SEL_TOKEN1 = selector("token1()")
 SEL_FACTORY = selector("factory()")
 SEL_GET_RESERVES = selector("getReserves()")
+SEL_POOL_KEYS = selector("poolKeys(bytes25)")      # v4 PositionManager
+SEL_EXTSLOAD = selector("extsload(bytes32)")       # v4 PoolManager raw storage read
+
+# Uniswap v4 PoolManager storage (v4-core StateLibrary): pools[poolId] lives at
+# keccak256(poolId . POOLS_SLOT); slot0 at +0 (sqrtPriceX96 in the low 160 bits),
+# active liquidity at +3 (uint128).
+V4_POOLS_SLOT = 6
+V4_LIQUIDITY_OFFSET = 3
 
 # Uniswap v2 (and forks) burn MINIMUM_LIQUIDITY LP tokens to the zero address on
 # the very first liquidity of a pair: a unique on-chain fingerprint.
@@ -95,3 +103,18 @@ def decode_string_result(result: str | None) -> str | None:
         return None
     return None
 
+
+
+def v4_state_slot(pool_id: str) -> int:
+    raw = _hex_bytes(pool_id).rjust(32, b"\x00")[-32:] + V4_POOLS_SLOT.to_bytes(32, "big")
+    return int.from_bytes(keccak256(raw), "big")
+
+
+def encode_extsload(slot: int) -> str:
+    return SEL_EXTSLOAD + (slot % (1 << 256)).to_bytes(32, "big").hex()
+
+
+def encode_pool_keys(pool_id: str) -> str:
+    """poolKeys(bytes25): the first 25 bytes of the pool id, left-aligned."""
+    raw = _hex_bytes(pool_id).rjust(32, b"\x00")[-32:]
+    return SEL_POOL_KEYS + (raw[:25] + b"\x00" * 7).hex()

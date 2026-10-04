@@ -32,7 +32,7 @@ from . import evm_abi as abi
 from .chains import Chain
 from .config import EvmRpc, Settings
 from .health import SourceStats
-from .models import LAUNCH, LIQUIDITY, PAIR, Detection, valid_address
+from .models import LAUNCH, LIQUIDITY, PAIR, STATUS_PAIR, Detection, valid_address
 from .rpc import NODE, REVERT, HttpRpc, RpcError, WsSubscriptions, cancel_requested
 
 if TYPE_CHECKING:
@@ -46,7 +46,9 @@ RESERVES_POOL_KINDS = ("v2", "solidly")
 BALANCE_POOL_KINDS = ("v3", "slipstream")
 WS_STALL_TIMEOUT_S = 180
 # Priority of each stream in the work queue (lower = first).
-PRIORITY = {"pairs": 0, "v4liq": 0, "mints": 1}
+PRIORITY = {"pairs": 0, "v4liq": 0, "v3mints": 1, "mints": 1}
+V4_SLOT0_PRICE_MASK = (1 << 160) - 1
+V4_LIQUIDITY_MASK = (1 << 128) - 1
 # How often a pool still waiting for liquidity is checked, by age.
 PENDING_SCHEDULE = ((600, 6.0), (3600, 30.0), (float("inf"), 120.0))
 RANGE_GROWTH_STREAK = 50       # successful eth_getLogs before trying a larger range again
@@ -140,6 +142,10 @@ class EvmWatcher:
         self.symbols: LRU = LRU(50_000)                 # address -> symbol ("" = not a token)
         self.seen_mints = BoundedSet(200_000)           # token contracts already processed
         self.seen_first_liq = BoundedSet(50_000)        # v2 pairs whose first liquidity was handled
+        self.seen_v3_pools = BoundedSet(100_000)        # v3 pools already inspected
+        self.seen_v4_pools = BoundedSet(100_000)        # v4 pool ids already inspected
+        self.v4_keys: LRU = LRU(50_000)                 # v4 pool id -> (currency0, currency1, hooks)
+        self._v4_layout_warned = False
         self._receipts: LRU = LRU(256)
         self._inflight: dict[str, asyncio.Future] = {}
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=50_000)
@@ -178,9 +184,16 @@ class EvmWatcher:
             topics0.append(abi.SOLIDLY_POOL_CREATED)
         if self.chain.slipstream_factories:
             topics0.append(abi.SLIPSTREAM_POOL_CREATED)
-        filters = {"mints": {"topics": [abi.TRANSFER, abi.ZERO_TOPIC]}}
+        filters = {
+            "mints": {"topics": [abi.TRANSFER, abi.ZERO_TOPIC]},
+            # every liquidity add on any v3-style pool (Uniswap, PancakeSwap, Aerodrome CL, forks)
+            "v3mints": {"topics": [abi.V3_MINT]},
+        }
         if topics0:
             filters["pairs"] = {"address": list(self.dex_by_address), "topics": [topics0]}
+        if self.chain.v4_pool_managers:
+            # every liquidity change on the Uniswap v4 singleton
+            filters["v4liq"] = {"address": list(self.chain.v4_pool_managers), "topics": [abi.V4_MODIFY_LIQUIDITY]}
         return filters
 
     def set_filter(self, name: str, flt: dict | None) -> None:
@@ -320,7 +333,8 @@ class EvmWatcher:
             await asyncio.sleep(self.settings.evm_poll_interval)
 
     async def _worker(self) -> None:
-        handlers = {"pairs": self.handle_pair, "mints": self.handle_mint, "v4liq": self.handle_v4_liquidity}
+        handlers = {"pairs": self.handle_pair, "mints": self.handle_mint, "v4liq": self.handle_v4_liquidity,
+                    "v3mints": self.handle_v3_mint}
         while True:
             _, _, name, lg = await self.queue.get()
             handler = handlers.get(name)
@@ -458,39 +472,226 @@ class EvmWatcher:
             pool_kind="launchpad", dex=label, source="onchain", tx_hash=tx,
         ))
 
-    async def handle_first_liquidity(self, pair: str, lg: dict) -> None:
-        """First liquidity of a v2-style pair (any factory, created at any time)."""
-        token0, token1 = await asyncio.gather(self._address_call(pair, abi.SEL_TOKEN0),
-                                              self._address_call(pair, abi.SEL_TOKEN1))
-        if not token0 or not token1:
-            return
-        tx = lg.get("transactionHash")
-        for token, other in ((token0, token1), (token1, token0)):
-            if token in self.chain.quote_tokens or token == abi.ZERO_ADDRESS:
-                continue
-            symbol = await self.token_symbol(token)
-            if not symbol or not self.scanner.is_watched(self.chain.key, symbol):
-                continue
-            if self.scanner.db.find_results(self.chain.key, pair):  # pair already known: just liquidity
-                await self.scanner.on_detection(Detection(
-                    chain=self.chain.key, kind=LIQUIDITY, token_address=token, pair_address=pair,
-                    source="onchain", tx_hash=tx))
-                return
-            name, quote_symbol, factory, receipt = await asyncio.gather(
-                self.token_name(token), self.token_symbol(other),
-                self._address_call(pair, abi.SEL_FACTORY), self.receipt(tx))
-            created_now = any(
-                (x.get("topics") or [None])[0] == abi.V2_PAIR_CREATED and abi.word_address(x.get("data"), 0) == pair
-                for x in receipt.get("logs") or [])
-            dex = self.dex_by_address.get(factory or "", ("v2", f"DEX v2 · {short(factory or pair)}"))[1]
-            self.stats.detections += 1
+    # ---- stealth launches: liquidity on pools created before we watched ----
+    async def _watched_side(self, token0: str, token1: str) -> tuple[str, str, str] | None:
+        """(token, other, symbol) when one side of a pool is a watched ticker."""
+        sides = [(t, o) for t, o in ((token0, token1), (token1, token0))
+                 if t not in self.chain.quote_tokens and t != abi.ZERO_ADDRESS]
+        symbols = await asyncio.gather(*(self.token_symbol(t) for t, _ in sides))
+        for (token, other), symbol in zip(sides, symbols):
+            if symbol and self.scanner.is_watched(self.chain.key, symbol):
+                return token, other, symbol
+        return None
+
+    async def _known_pool(self, key: str, lg: dict) -> bool:
+        """A pool we already report: its liquidity event is just a 🟢 for a pending pair."""
+        results = self.scanner.db.find_results(self.chain.key, key)
+        if not results:
+            return False
+        pending = next((r for r in results if r.status == STATUS_PAIR), None)
+        if pending is not None:
             await self.scanner.on_detection(Detection(
-                chain=self.chain.key, kind=PAIR, token_address=token, symbol=symbol, name=name,
-                pair_address=pair, pool_kind="v2", dex=dex, quote_symbol=quote_symbol or None,
-                quote_address=other, has_liquidity=True, pre_existing_pair=not created_now,
-                source="onchain", tx_hash=tx,
-            ))
+                chain=self.chain.key, kind=LIQUIDITY, token_address=pending.token_address, pair_address=key,
+                source="onchain", tx_hash=lg.get("transactionHash")))
+        return True
+
+    async def _pool_tokens(self, pool: str) -> tuple[str, str] | None:
+        """token0/token1 of a v2/v3 pool; None if it is not a pool; RpcError if the node failed."""
+        results = await asyncio.gather(self._call(pool, abi.SEL_TOKEN0), self._call(pool, abi.SEL_TOKEN1),
+                                       return_exceptions=True)
+        for res in results:
+            if isinstance(res, RpcError):
+                if res.kind == REVERT:
+                    return None
+                raise res
+            if isinstance(res, BaseException):
+                raise res
+        token0, token1 = abi.word_address(results[0], 0), abi.word_address(results[1], 0)
+        if not (valid_address("evm", token0) and valid_address("evm", token1)) or token0 == token1:
+            return None
+        return token0, token1
+
+    async def _report_stealth(self, lg: dict, *, pool: str, token: str, other: str, symbol: str,
+                              pool_kind: str, dex: str, created_now: bool, kind: str = PAIR) -> None:
+        name, quote_symbol = await asyncio.gather(self.token_name(token), self.token_symbol(other))
+        self.stats.detections += 1
+        await self.scanner.on_detection(Detection(
+            chain=self.chain.key, kind=kind, token_address=token, symbol=symbol, name=name,
+            pair_address=pool, pool_kind=pool_kind, dex=dex, quote_symbol=quote_symbol or None,
+            quote_address=other, has_liquidity=True, pre_existing_pair=not created_now,
+            source="onchain", tx_hash=lg.get("transactionHash"),
+        ))
+
+    async def handle_first_liquidity(self, pair: str, lg: dict) -> None:
+        """First liquidity of a v2-style pair (MINIMUM_LIQUIDITY burn), any factory, any age."""
+        if await self._known_pool(pair, lg):
             return
+        try:
+            tokens = await self._pool_tokens(pair)
+        except RpcError:
+            self.seen_first_liq.discard(pair)  # retry on the next event
+            return
+        if tokens is None:
+            return
+        match = await self._watched_side(*tokens)
+        if match is None:
+            return
+        token, other, symbol = match
+        factory, receipt = await asyncio.gather(self._address_call(pair, abi.SEL_FACTORY),
+                                                self.receipt(lg.get("transactionHash")))
+        created_now = any(
+            (x.get("topics") or [None])[0] == abi.V2_PAIR_CREATED and abi.word_address(x.get("data"), 0) == pair
+            for x in receipt.get("logs") or [])
+        dex = self.dex_by_address.get(factory or "", ("v2", f"DEX v2 · {short(factory or pair)}"))[1]
+        await self._report_stealth(lg, pool=pair, token=token, other=other, symbol=symbol, pool_kind="v2",
+                                   dex=dex, created_now=created_now)
+
+    async def handle_v3_mint(self, lg: dict) -> None:
+        """Liquidity added to a v3-style pool: report its first liquidity, whatever its age or factory."""
+        topics = lg.get("topics") or []
+        if len(topics) != 4 or topics[0] != abi.V3_MINT:
+            return
+        pool = (lg.get("address") or "").lower()
+        if not valid_address("evm", pool):
+            return
+        if await self._known_pool(pool, lg):
+            return
+        if pool in self.seen_v3_pools:
+            return
+        self.seen_v3_pools.add(pool)
+        try:
+            tokens = await self._pool_tokens(pool)
+        except RpcError:
+            self.seen_v3_pools.discard(pool)
+            return
+        if tokens is None:
+            return
+        match = await self._watched_side(*tokens)
+        if match is None:
+            return
+        token, other, symbol = match
+        block = _hex_int(lg.get("blockNumber"))
+        if not await self._v3_was_empty(pool, tokens, block):
+            return  # an established pool, not a launch
+        factory, receipt = await asyncio.gather(self._address_call(pool, abi.SEL_FACTORY),
+                                                self.receipt(lg.get("transactionHash")))
+        created_now = False
+        for x in receipt.get("logs") or []:
+            t0 = (x.get("topics") or [None])[0]
+            if (t0 == abi.V3_POOL_CREATED and abi.word_address(x.get("data"), 1) == pool) or \
+                    (t0 == abi.SLIPSTREAM_POOL_CREATED and abi.word_address(x.get("data"), 0) == pool):
+                created_now = True
+        kind, dex = self.dex_by_address.get(factory or "", ("v3", f"DEX v3 · {short(factory or pool)}"))
+        await self._report_stealth(lg, pool=pool, token=token, other=other, symbol=symbol,
+                                   pool_kind=kind if kind in BALANCE_POOL_KINDS else "v3", dex=dex,
+                                   created_now=created_now)
+
+    async def _v3_was_empty(self, pool: str, tokens: tuple[str, str], block: int) -> bool:
+        """The pool held none of its two tokens before this block: this is its first liquidity."""
+        if block <= 0:
+            return False
+        before = hex(block - 1)
+        try:
+            balances = await asyncio.gather(*(
+                self.rpc.call("eth_call", [{"to": t, "data": abi.encode_address_call(abi.SEL_BALANCE_OF, pool)},
+                                           before]) for t in tokens))
+        except RpcError:
+            return False  # state not available: let DexScreener confirm instead of guessing
+        return all(_hex_int(b) == 0 for b in balances)
+
+    async def handle_v4_liquidity(self, lg: dict) -> None:
+        """Liquidity added on the v4 PoolManager: pending pools, and first liquidity of any pool."""
+        topics = lg.get("topics") or []
+        if len(topics) < 2 or topics[0] != abi.V4_MODIFY_LIQUIDITY:
+            return
+        if abi.word_int(lg.get("data"), 2) <= 0:
+            return
+        manager = (lg.get("address") or "").lower()
+        pool_id = topics[1].lower() if isinstance(topics[1], str) else ""
+        if manager not in self.chain.v4_pool_managers or not valid_address("evm", pool_id, pool=True):
+            return
+        if await self._known_pool(pool_id, lg):
+            return
+        if pool_id in self.seen_v4_pools:
+            return
+        self.seen_v4_pools.add(pool_id)
+        sender = abi.topic_address(topics[2]) if len(topics) > 2 else None
+        key = self.v4_keys.get(pool_id) or await self._v4_pool_key(manager, pool_id, sender, lg)
+        if key is None:
+            return
+        currency0, currency1, hooks = key
+        match = await self._watched_side(currency0, currency1)
+        if match is None:
+            return
+        token, other, symbol = match
+        if not await self._v4_was_empty(manager, pool_id, _hex_int(lg.get("blockNumber"))):
+            return
+        receipt = await self.receipt(lg.get("transactionHash"))
+        created_now = any((x.get("topics") or [None])[0] == abi.V4_INITIALIZE
+                          and len(x.get("topics") or []) > 1 and str(x["topics"][1]).lower() == pool_id
+                          for x in receipt.get("logs") or [])
+        launchpad = self.chain.v4_hooks.get(hooks or "")
+        dex = self.chain.v4_pool_managers[manager]
+        await self._report_stealth(lg, pool=pool_id, token=token, other=other, symbol=symbol, pool_kind="v4",
+                                   dex=f"{launchpad} · {dex}" if launchpad else dex, created_now=created_now,
+                                   kind=LAUNCH if launchpad else PAIR)
+
+    async def _v4_pool_key(self, manager: str, pool_id: str, sender: str | None,
+                           lg: dict) -> tuple[str, str, str] | None:
+        """Currencies + hooks of a v4 pool, verified: keccak(abi.encode(PoolKey)) must equal the pool id."""
+        candidates = [a for a in (self.chain.v4_position_manager, sender) if a and valid_address("evm", a)]
+        for contract in dict.fromkeys(candidates):
+            try:
+                data = await self._call(contract, abi.encode_pool_keys(pool_id))
+            except RpcError:
+                continue
+            raw = abi._hex_bytes(data)[:160]  # noqa: SLF001
+            if len(raw) == 160 and "0x" + abi.keccak256(raw).hex() == pool_id:
+                key = (abi.word_address(data, 0), abi.word_address(data, 1), abi.word_address(data, 4))
+                self.v4_keys.put(pool_id, key)
+                return key
+        # Pools created by custom lockers: their Initialize, if recent enough to fetch cheaply.
+        block = _hex_int(lg.get("blockNumber"))
+        if block and self.max_range >= 1000:
+            try:
+                logs = await self._get_logs({"address": manager, "topics": [abi.V4_INITIALIZE, pool_id]},
+                                            max(0, block - self.backfill_blocks), block)
+            except RpcError:
+                logs = []
+            for init in logs:
+                decoded = self._decode_pair(init)
+                if decoded is not None:
+                    key = (decoded[2], decoded[3], decoded[5])
+                    self.v4_keys.put(pool_id, key)
+                    return key
+        return None
+
+    async def _v4_was_empty(self, manager: str, pool_id: str, block: int) -> bool:
+        """No active liquidity (or not even initialized) right before this block, read from storage."""
+        if block <= 0:
+            return False
+        slot = abi.v4_state_slot(pool_id)
+        before = hex(block - 1)
+        try:
+            now_slot0, prev_slot0, prev_liquidity = await asyncio.gather(
+                self.rpc.call("eth_call", [{"to": manager, "data": abi.encode_extsload(slot)}, "latest"]),
+                self.rpc.call("eth_call", [{"to": manager, "data": abi.encode_extsload(slot)}, before]),
+                self.rpc.call("eth_call", [{"to": manager, "data": abi.encode_extsload(
+                    slot + abi.V4_LIQUIDITY_OFFSET)}, before]),
+            )
+        except RpcError:
+            return False
+        if abi.word_uint(now_slot0, 0) & V4_SLOT0_PRICE_MASK == 0:
+            # A pool receiving liquidity is initialized: if we read nothing, the storage layout
+            # is not the one we expect (fork/upgrade). Never guess.
+            if not self._v4_layout_warned:
+                self._v4_layout_warned = True
+                log.warning("[%s] lecture du stockage v4 incohérente, détection furtive v4 désactivée",
+                            self.chain.key)
+            return False
+        if abi.word_uint(prev_slot0, 0) & V4_SLOT0_PRICE_MASK == 0:
+            return True  # initialized in this very block
+        return abi.word_uint(prev_liquidity, 0) & V4_LIQUIDITY_MASK == 0
 
     def _decode_pair(self, lg: dict) -> tuple[str, str, str, str, str, str | None] | None:
         """-> (pool_kind, dex, token0, token1, pool_address_or_id, hooks)"""
@@ -523,6 +724,8 @@ class EvmWatcher:
         if decoded is None:
             return
         kind, dex, token0, token1, pool, hooks = decoded
+        if kind == "v4":
+            self.v4_keys.put(pool, (token0, token1, hooks))
         candidates = [(t, o) for t, o in ((token0, token1), (token1, token0))
                       if t not in self.chain.quote_tokens and t != abi.ZERO_ADDRESS]
         symbols = await asyncio.gather(*(self.token_symbol(t) for t, _ in candidates))
@@ -558,20 +761,6 @@ class EvmWatcher:
                 return True
         return False
 
-    async def handle_v4_liquidity(self, lg: dict) -> None:
-        topics = lg.get("topics") or []
-        if len(topics) < 2 or topics[0] != abi.V4_MODIFY_LIQUIDITY:
-            return
-        if abi.word_int(lg.get("data"), 2) <= 0:
-            return
-        pool_id = topics[1].lower()
-        results = self.scanner.db.find_results(self.chain.key, pool_id)
-        if results:
-            await self.scanner.on_detection(Detection(
-                chain=self.chain.key, kind=LIQUIDITY, token_address=results[0].token_address,
-                pair_address=pool_id, source="onchain", tx_hash=lg.get("transactionHash"),
-            ))
-
     async def _has_liquidity(self, res) -> bool:
         if res.pool_kind in RESERVES_POOL_KINDS:
             # Real two-sided reserves: tokens merely sent to the pair do not count.
@@ -584,14 +773,6 @@ class EvmWatcher:
         now = now or time.time()
         max_age = self.settings.pending_liquidity_max_age_h * 3600
         pending = self.scanner.db.pending_results(max_age, chains=[self.chain.key])
-        v4_ids = sorted({r.pair_address for r in pending if r.pool_kind == "v4" and r.pair_address})
-        if v4_ids and self.chain.v4_pool_managers:
-            self.set_filter("v4liq", {
-                "address": list(self.chain.v4_pool_managers),
-                "topics": [[abi.V4_MODIFY_LIQUIDITY], v4_ids],
-            })
-        else:
-            self.set_filter("v4liq", None)
         live_ids = {r.id for r in pending}
         for stale in [rid for rid in self._next_check if rid not in live_ids]:
             del self._next_check[stale]

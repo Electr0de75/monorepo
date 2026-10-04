@@ -38,6 +38,11 @@ class FakeEvmNode:
         self.balances: dict[tuple[str, str], int] = {}
         self.reserves: dict[str, tuple[int, int]] = {}
         self.pair_tokens: dict[str, tuple[str, str, str]] = {}  # pair -> (token0, token1, factory)
+        # state "before the block" for historical eth_call (block param != "latest")
+        self.prev_balances: dict[tuple[str, str], int] = {}
+        self.storage: dict[tuple[str, int], int] = {}        # (contract, slot) -> value (latest)
+        self.prev_storage: dict[tuple[str, int], int] = {}   # same, before the block
+        self.pool_keys: dict[tuple[str, str], str] = {}      # (position manager, bytes25 hex) -> raw key hex
         self.block = 0x100
         self.logs: list[dict] = []
         self.calls: list[tuple[str, Any]] = []
@@ -50,7 +55,18 @@ class FakeEvmNode:
         if method == "eth_call":
             to = params[0]["to"].lower()
             data = params[0]["data"]
-            if data == abi.SEL_SYMBOL:
+            historical = len(params) > 1 and params[1] != "latest"
+            if data.startswith(abi.SEL_EXTSLOAD):
+                slot = int(data[len(abi.SEL_EXTSLOAD):], 16)
+                store = self.prev_storage if historical else self.storage
+                result = "0x" + uint_word(store.get((to, slot), 0))
+            elif data.startswith(abi.SEL_POOL_KEYS):
+                raw = self.pool_keys.get((to, data[len(abi.SEL_POOL_KEYS):][:50]))
+                result = "0x" + (raw if raw else "00" * 160)
+            elif data.startswith(abi.SEL_BALANCE_OF) and historical:
+                holder = "0x" + data[-40:]
+                result = "0x" + uint_word(self.prev_balances.get((to, holder), 0))
+            elif data == abi.SEL_SYMBOL:
                 if to not in self.symbols:
                     return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
                                                      "error": {"code": 3, "message": "execution reverted"}})
@@ -237,3 +253,10 @@ class FakeWebSocket:
 
     def close(self) -> None:
         self.incoming.put_nowait(None)
+
+
+def v4_pool(currency0: str, currency1: str, hooks: str = "0x" + "0" * 40, fee: int = 3000,
+            tick_spacing: int = 60) -> tuple[str, str]:
+    """(pool_id, raw PoolKey hex) exactly as Uniswap v4 computes them."""
+    raw = addr_word(currency0) + addr_word(currency1) + uint_word(fee) + uint_word(tick_spacing) + addr_word(hooks)
+    return "0x" + abi.keccak256(bytes.fromhex(raw)).hex(), raw
